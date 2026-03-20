@@ -1,0 +1,1888 @@
+import os
+import sys
+import subprocess
+import asyncio
+import logging
+import random
+import sqlite3
+import time
+import html
+from datetime import datetime, timedelta, timezone
+from io import BytesIO
+
+# === АВТОМАТИЧЕСКАЯ УСТАНОВКА БИБЛИОТЕК ===
+def install_requirements():
+    requirements = ["aiogram==3.4.1", "Pillow==10.2.0"]
+    installed_libs = []
+    
+    try:
+        import aiogram
+        installed_libs.append("aiogram")
+    except ImportError: pass
+    
+    try:
+        from PIL import Image
+        installed_libs.append("Pillow")
+    except ImportError: pass
+
+    needed_install = [lib for lib in requirements if lib.split('==')[0] not in installed_libs]
+    
+    if needed_install:
+        print(f"Не найдены необходимые библиотеки: {', '.join(needed_install)}. Начинаю автоматическую установку...")
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install"] + needed_install)
+            print("Установка успешно завершена! Загружаю бота...")
+        except Exception as e:
+            print(f"Критическая ошибка при установке библиотек: {e}")
+            sys.exit(1)
+
+install_requirements()
+
+from aiogram import Bot, Dispatcher, F, BaseMiddleware, Router
+from aiogram.types import (
+    Message, CallbackQuery, ReplyKeyboardMarkup, 
+    KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton,
+    BotCommand, BufferedInputFile
+)
+from aiogram.filters import CommandStart, Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
+from PIL import Image, ImageOps, ImageDraw
+
+# === КОНФИГУРАЦИЯ СЛОТОВ ===
+TOKEN = "8770327861:AAEPgHBTjpoqhLsl8f8KMoyzo1xrtWjeyrM"
+
+try:
+    MAIN_BOT_ID = int(TOKEN.split(":")[0])
+except ValueError:
+    print("Ошибка: Неверный формат токена.")
+    sys.exit(1)
+
+MAIN_ADMIN_ID = 1018561747
+MAIN_CHANNEL = "@L1meYT"
+COOLDOWN_SECONDS = 600  # 10 минут
+
+UPDATE_LOG_TEXT = (
+    "<b>🚀 Глобальное обновление системы!\n\n"
+    "• 🗡 ТИПЫ АТАК: Добавлены новые атаки! 🛜AOE🛜 (бьет всех), 💥SPLASH💥 (бьет двоих) и 🔥FIRE🔥 (поджигает врага)!\n"
+    "• 🛍 НОВЫЙ МАГАЗИН: Добавлены мега-паки (вплоть до х50) и паки со 100% шансом на Легу, Мифик и Божественную!\n"
+    "• 🏅 РАНГИ: В профиле теперь отображается ваше звание от Новичка до Мастера.\n"
+    "• 🕵️‍♂️ ПРОСМОТР ЭКИПИРОВКИ: Ответьте на сообщение игрока командой /equip, чтобы посмотреть его колоду.\n"
+    "• 🛡 АДМИН-ПАНЕЛЬ: Добавлены команды /ban, /unban, /getmoney и /gettrophies с системой логов.\n"
+    "• 🏆 ЧЕСТНЫЕ ТОПЫ: Админы скрыты из списков лидеров.\n"
+    "• ⏰ РАСПИСАНИЕ МАГАЗИНА: Магазин паков обновляется строго по расписанию по МСК!\n"
+    "• 🎲 СИСТЕМА ГАРАНТА (PITY): Пороги переработаны.\n"
+    "• ⚔️ АНТИ-АБУЗ: Запрещено участвовать в нескольких боях одновременно.\n"
+    "• 🤖 БОЙ С БОТОМ: В поиске боя можно сыграть с ботом.</b>"
+)
+
+# Словарь цветов рамок для редкостей
+RARITY_FRAME_COLORS = {
+    "⬜️Обычная⬜️": "#808080",
+    "🟩Необычная🟩": "#008000",
+    "🟦Редкая🟦": "#0000FF",
+    "🟪Эпическая🟪": "#800080",
+    "🟨Легендарная🟨": "#FFD700",
+    "🟥Мифическая🟥": "#FF0000",
+    "🔵Божественная🔵": "#87CEEB",
+    "🟣Эксклюзивная🟣": "#9400D3",
+    "🌌Галактическая🌌": "#9400D3"
+}
+
+# Система Пити (Гарант) - От высшего к низшему
+PITY_THRESHOLDS = {
+    "🌌Галактическая🌌": 1000,
+    "🔵Божественная🔵": 500,
+    "🟣Эксклюзивная🟣": 250,
+    "🟥Мифическая🟥": 100,
+    "🟨Легендарная🟨": 45,
+    "🟪Эпическая🟪": 10
+}
+
+# Конфигурация магазина паков
+PACKS_CONFIG = {
+    "pack_x1": {"name": "🃏набор карт \"x1\"🃏", "price": 100, "cards": 1, "luck": 1.0, "force_rarity": None, "stock": (0, 50)},
+    "pack_x2": {"name": "🃏набор карт \"x2\"🃏", "price": 200, "cards": 2, "luck": 1.0, "force_rarity": None, "stock": (0, 30)},
+    "pack_x3": {"name": "🃏набор карт \"x3\"🃏", "price": 300, "cards": 3, "luck": 1.0, "force_rarity": None, "stock": (0, 30)},
+    "pack_x5": {"name": "🃏набор карт \"x5\"🃏", "price": 500, "cards": 5, "luck": 1.0, "force_rarity": None, "stock": (0, 20)},
+    "pack_x10": {"name": "🃏набор карт \"x10\"🃏", "price": 1000, "cards": 10, "luck": 1.0, "force_rarity": None, "stock": (0, 15)},
+    "pack_x15": {"name": "🃏набор карт \"x15\"🃏", "price": 1500, "cards": 15, "luck": 1.0, "force_rarity": None, "stock": (0, 10)},
+    "pack_x20": {"name": "🃏набор карт \"x20\"🃏", "price": 2000, "cards": 20, "luck": 1.0, "force_rarity": None, "stock": (0, 3)},
+    "pack_x50": {"name": "🃏набор карт \"x50\"🃏", "price": 5000, "cards": 50, "luck": 1.0, "force_rarity": None, "stock": (0, 1)},
+    "pack_leg": {"name": "🃏набор карт \"🟨Легендарная🟨\"🃏", "price": 1000, "cards": 1, "luck": 1.0, "force_rarity": "🟨Легендарная🟨", "stock": (0, 10)},
+    "pack_myth": {"name": "🃏набор карт \"🟥Мифическая🟥\"🃏", "price": 10000, "cards": 1, "luck": 1.0, "force_rarity": "🟥Мифическая🟥", "stock": (0, 5)},
+    "pack_div": {"name": "🃏набор карт \"🔵Божественная🔵\"🃏", "price": 50000, "cards": 1, "luck": 1.0, "force_rarity": "🔵Божественная🔵", "stock": (0, 1)}
+}
+
+# Колоды бота по категориям
+BOT_DECKS = {
+    1: ["⬜️Обычная⬜️", "🟩Необычная🟩"],
+    2: ["🟩Необычная🟩", "🟦Редкая🟦"],
+    3: ["🟦Редкая🟦", "🟪Эпическая🟪"],
+    4: ["🟪Эпическая🟪", "🟨Легендарная🟨"],
+    5: ["🟨Легендарная🟨", "🟥Мифическая🟥"],
+    6: ["🟥Мифическая🟥", "🔵Божественная🔵", "🟣Эксклюзивная🟣", "🌌Галактическая🌌"]
+}
+
+# Преимущества элементов
+ELEMENT_ADVANTAGES = {
+    "💧": ["🔥", "☢️", "🪖"],
+    "🔥": ["🪵", "🔮", "🪖"],
+    "🌪": ["🔥", "☢️", "🪖"],
+    "🪵": ["🌪", "💧", "🪖"],
+    "☢️": ["🪵", "🔮", "🪖"],
+    "🔮": ["💧", "🪖"],
+    "🪖": [] # Каска проигрывает всем
+}
+
+logging.basicConfig(level=logging.INFO)
+
+RUNNING_BOTS = {}
+PENDING_DUELS = {} 
+MATCHMAKING = {} 
+SEARCH_TASKS = {} 
+ACTIVE_PACK_SHOP = {} 
+ACTIVE_BATTLES = {} # bot_id -> set(user_id)
+
+# === БАЗА ДАННЫХ ===
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, 'bot_data')
+
+def get_db_path(bot_id: int) -> str:
+    if bot_id == MAIN_BOT_ID: return os.path.join(DATA_DIR, 'cards_bot.db')
+    return os.path.join(DATA_DIR, f'child_{bot_id}.db')
+
+def get_db_connection(bot_id: int):
+    conn = sqlite3.connect(get_db_path(bot_id), timeout=20.0)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    return conn
+
+def init_db(bot_id: int, admin_id: int):
+    if not os.path.exists(DATA_DIR): os.makedirs(DATA_DIR)
+    conn = get_db_connection(bot_id)
+    cursor = conn.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, username TEXT, balance INTEGER DEFAULT 0, last_getcard INTEGER DEFAULT 0, trophies INTEGER DEFAULT 0, is_banned INTEGER DEFAULT 0)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS cards (card_id INTEGER PRIMARY KEY AUTOINCREMENT, photo_id TEXT NOT NULL, name TEXT NOT NULL, weight REAL DEFAULT 1, rarity TEXT, reward INTEGER DEFAULT 0, damage INTEGER DEFAULT 0, health INTEGER DEFAULT 0, element TEXT DEFAULT '🔥', attack_type TEXT DEFAULT '')''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS inventory (user_id INTEGER, card_id INTEGER, amount INTEGER DEFAULT 0, is_equipped INTEGER DEFAULT 0, UNIQUE(user_id, card_id))''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS pity (user_id INTEGER, rarity TEXT, counter INTEGER DEFAULT 0, UNIQUE(user_id, rarity))''')
+    cursor.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (admin_id,))
+    if bot_id == MAIN_BOT_ID: cursor.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (MAIN_ADMIN_ID,))
+    cursor.execute('''CREATE TABLE IF NOT EXISTS chats (chat_id INTEGER PRIMARY KEY, type TEXT)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS events (event_type TEXT PRIMARY KEY, multiplier REAL, end_time INTEGER)''')
+    if bot_id == MAIN_BOT_ID: cursor.execute('''CREATE TABLE IF NOT EXISTS child_bots (bot_id INTEGER PRIMARY KEY, token TEXT, owner_id INTEGER)''')
+
+    cursor.execute("PRAGMA table_info(users)")
+    user_cols = [col[1] for col in cursor.fetchall()]
+    if 'username' not in user_cols: cursor.execute("ALTER TABLE users ADD COLUMN username TEXT")
+    if 'trophies' not in user_cols: cursor.execute("ALTER TABLE users ADD COLUMN trophies INTEGER DEFAULT 0")
+    if 'balance' not in user_cols: cursor.execute("ALTER TABLE users ADD COLUMN balance INTEGER DEFAULT 0")
+    if 'is_banned' not in user_cols: cursor.execute("ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0")
+
+    cursor.execute("PRAGMA table_info(cards)")
+    card_cols = [col[1] for col in cursor.fetchall()]
+    if 'rarity' not in card_cols: cursor.execute("ALTER TABLE cards ADD COLUMN rarity TEXT DEFAULT 'common'")
+    if 'damage' not in card_cols: cursor.execute("ALTER TABLE cards ADD COLUMN damage INTEGER DEFAULT 0")
+    if 'health' not in card_cols: cursor.execute("ALTER TABLE cards ADD COLUMN health INTEGER DEFAULT 0")
+    if 'element' not in card_cols: cursor.execute("ALTER TABLE cards ADD COLUMN element TEXT DEFAULT '🔥'")
+    if 'attack_type' not in card_cols: cursor.execute("ALTER TABLE cards ADD COLUMN attack_type TEXT DEFAULT ''")
+
+    cursor.execute("PRAGMA table_info(inventory)")
+    inv_cols = [col[1] for col in cursor.fetchall()]
+    if 'is_equipped' not in inv_cols: cursor.execute("ALTER TABLE inventory ADD COLUMN is_equipped INTEGER DEFAULT 0")
+
+    cursor.execute("UPDATE cards SET rarity = '🟣Эксклюзивная🟣' WHERE rarity = '🌌Галактическая🌌'")
+    conn.commit()
+    conn.close()
+
+class TrackerMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        try:
+            msg = getattr(event, 'message', None)
+            channel_post = getattr(event, 'channel_post', None)
+            my_chat_member = getattr(event, 'my_chat_member', None)
+            call = getattr(event, 'callback_query', None)
+
+            chat = msg.chat if msg else (channel_post.chat if channel_post else (my_chat_member.chat if my_chat_member else (call.message.chat if call and call.message else None)))
+            user = msg.from_user if msg else (call.from_user if call else None)
+            bot: Bot = data.get('bot')
+
+            if chat and bot:
+                for attempt in range(5):
+                    try:
+                        conn = get_db_connection(bot.id)
+                        cursor = conn.cursor()
+                        cursor.execute("INSERT OR IGNORE INTO chats (chat_id, type) VALUES (?, ?)", (chat.id, chat.type))
+                        
+                        if user and not user.is_bot:
+                            cursor.execute("INSERT OR IGNORE INTO users (user_id, balance, last_getcard, trophies, is_banned) VALUES (?, 0, 0, 0, 0)", (user.id,))
+                            if user.username: 
+                                cursor.execute("UPDATE users SET username = ? WHERE user_id = ?", (user.username, user.id))
+                            
+                            cursor.execute("SELECT is_banned FROM users WHERE user_id = ?", (user.id,))
+                            ban_res = cursor.fetchone()
+                            if ban_res and ban_res[0] == 1:
+                                conn.commit()
+                                conn.close()
+                                return # ИГНОРИРОВАТЬ ЗАБАНЕННЫХ
+                        
+                        conn.commit()
+                        conn.close()
+                        break 
+                    except sqlite3.OperationalError as e:
+                        if "locked" in str(e): await asyncio.sleep(random.uniform(0.05, 0.2))
+                        else: break
+        except Exception as e: logging.error(f"TrackerMiddleware Error: {e}")
+        return await handler(event, data)
+
+def get_main_kb(is_admin_user=False):
+    kb = [
+        [KeyboardButton(text="🃏 Выбить карту"), KeyboardButton(text="⚔️ Поиск боя")],
+        [KeyboardButton(text="🎒 Инвентарь"), KeyboardButton(text="🛡 Экипировка")],
+        [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="🏆 Топ игроков")],
+        [KeyboardButton(text="📖 Индекс"), KeyboardButton(text="📊 Стихии")]
+    ]
+    if is_admin_user:
+        kb.append([KeyboardButton(text="Добавить карту"), KeyboardButton(text="Удалить карту")])
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
+
+# === ФОРМАТИРОВАНИЕ ЭЛЕМЕНТА И АТАКИ ===
+def fmt_el(elem, atype):
+    return f"{elem}|{atype}" if atype else f"{elem}"
+
+# === УТИЛИТЫ ДЛЯ КУБКОВ, МОНЕТ И ПОИСКА ===
+def get_win_trophies(t: int) -> int:
+    if t <= 100: return random.randint(1, 10)
+    elif t <= 200: return random.randint(1, 8)
+    elif t <= 300: return random.randint(1, 7)
+    elif t <= 400: return random.randint(1, 6)
+    elif t <= 500: return random.randint(1, 5)
+    else: return random.randint(1, 3)
+
+def get_loss_trophies(t: int) -> int:
+    if t <= 100: return random.randint(1, 3)
+    elif t <= 200: return random.randint(2, 4)
+    elif t <= 300: return random.randint(2, 6)
+    elif t <= 400: return random.randint(4, 8)
+    elif t <= 500: return random.randint(5, 10)
+    else: return random.randint(5, 15)
+
+def get_win_coins(t: int) -> int:
+    if t <= 10: return random.randint(1, 10)
+    elif t <= 50: return random.randint(5, 25)
+    elif t <= 150: return random.randint(20, 40)
+    elif t <= 250: return random.randint(30, 70)
+    elif t <= 400: return random.randint(50, 100)
+    else: return random.randint(80, 150)
+
+def get_mm_category(t: int) -> int:
+    if t <= 200: return 1
+    elif t <= 400: return 2
+    elif t <= 600: return 3
+    elif t <= 1000: return 4
+    elif t <= 1500: return 5
+    else: return 6
+
+def get_rank_name(cat: int) -> str:
+    ranks = {1: "Новичок", 2: "Игрок", 3: "Профи", 4: "Профи+", 5: "Профи++", 6: "Мастер"}
+    return ranks.get(cat, "Новичок")
+
+def is_admin(user_id: int, bot_id: int) -> bool:
+    conn = get_db_connection(bot_id)
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM admins WHERE user_id = ?", (user_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return bool(result)
+
+def get_user_id_by_input(input_data: str, bot_id: int):
+    if input_data.isdigit(): return int(input_data)
+    input_data = input_data.replace("@", "")
+    conn = get_db_connection(bot_id)
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM users WHERE username = ? COLLATE NOCASE", (input_data,))
+    result = cursor.fetchone()
+    conn.close()
+    return result[0] if result else None
+
+async def notify_admins(bot: Bot, text: str):
+    conn = get_db_connection(bot.id)
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM admins")
+    admins = cursor.fetchall()
+    conn.close()
+    for (adm_id,) in admins:
+        try: await bot.send_message(adm_id, f"<b>⚠️ АДМИН-ЛОГ:</b>\n{text}", parse_mode="HTML")
+        except Exception: pass
+
+def set_event(event_type: str, multiplier: float, minutes: int, bot_id: int):
+    end_time = int(time.time()) + (minutes * 60)
+    conn = get_db_connection(bot_id)
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR REPLACE INTO events (event_type, multiplier, end_time) VALUES (?, ?, ?)", (event_type, multiplier, end_time))
+    conn.commit()
+    conn.close()
+
+def get_active_event(event_type: str, bot_id: int):
+    conn = get_db_connection(bot_id)
+    cursor = conn.cursor()
+    cursor.execute("SELECT multiplier, end_time FROM events WHERE event_type = ?", (event_type,))
+    result = cursor.fetchone()
+    conn.close()
+    if result:
+        multiplier, end_time = result
+        if int(time.time()) < end_time: return multiplier
+        else:
+            conn = get_db_connection(bot_id)
+            conn.execute("DELETE FROM events WHERE event_type = ?", (event_type,))
+            conn.commit()
+            conn.close()
+    return None
+
+async def apply_frame(photo_bytes: BytesIO, rarity: str) -> BufferedInputFile:
+    frame_color = RARITY_FRAME_COLORS.get(rarity, "#FFFFFF")
+    FRAME_WIDTH = 10
+    try:
+        with Image.open(photo_bytes) as img:
+            if img.mode != 'RGB': img = img.convert('RGB')
+            width, height = img.size
+            draw = ImageDraw.Draw(img)
+            draw.line([(FRAME_WIDTH/2, 0), (FRAME_WIDTH/2, height)], fill=frame_color, width=FRAME_WIDTH)
+            draw.line([(width - FRAME_WIDTH/2, 0), (width - FRAME_WIDTH/2, height)], fill=frame_color, width=FRAME_WIDTH)
+            draw.line([(0, FRAME_WIDTH/2), (width, FRAME_WIDTH/2)], fill=frame_color, width=FRAME_WIDTH)
+            draw.line([(0, height - FRAME_WIDTH/2), (width, height - FRAME_WIDTH/2)], fill=frame_color, width=FRAME_WIDTH)
+            output_buffer = BytesIO()
+            img.save(output_buffer, format="JPEG")
+            return BufferedInputFile(output_buffer.getvalue(), filename="drop_with_frame.jpg")
+    except Exception as e:
+        logging.error(f"Ошибка Pillow: {e}")
+        return BufferedInputFile(photo_bytes.getvalue(), filename="drop_original.jpg")
+
+async def smart_reply(message: Message, text: str, parse_mode="HTML", reply_markup=None, photo=None):
+    text = f"<b>{text}</b>"
+    for attempt in range(3):
+        try:
+            if message.chat.type in ['group', 'supergroup']:
+                if photo: return await message.reply_photo(photo=photo, caption=text, parse_mode=parse_mode, reply_markup=reply_markup)
+                else: return await message.reply(text, parse_mode=parse_mode, reply_markup=reply_markup)
+            else:
+                if photo: return await message.answer_photo(photo=photo, caption=text, parse_mode=parse_mode, reply_markup=reply_markup)
+                else: return await message.answer(text, parse_mode=parse_mode, reply_markup=reply_markup)
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+        except Exception as e:
+            logging.error(f"Send Error: {e}")
+            if photo: photo = None; continue
+            break
+
+async def broadcast(bot: Bot, text: str, reply_markup=None):
+    text = f"<b>{text}</b>"
+    bot_id = bot.id
+    conn = get_db_connection(bot_id)
+    cursor = conn.cursor()
+    cursor.execute("SELECT chat_id, type FROM chats")
+    chat_rows = cursor.fetchall()
+    channel_ids = {row[0] for row in chat_rows if row[1] == 'channel'}
+    chat_ids = {row[0] for row in chat_rows}
+    cursor.execute("SELECT user_id FROM users")
+    user_ids = {row[0] for row in cursor.fetchall()}
+    conn.close()
+
+    all_targets = set(chat_ids).union(set(user_ids))
+    if not reply_markup:
+        reply_markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📢 Новости и сливы карточек", url="https://t.me/L1meYT")],
+            [InlineKeyboardButton(text="👾 Наш Discord сервер", url="https://discord.gg/6Xm595gP")]
+        ])
+
+    success, failed = 0, 0
+    if bot_id == MAIN_BOT_ID:
+        all_targets.add(MAIN_CHANNEL)
+        try:
+            await bot.send_message(MAIN_CHANNEL, text, parse_mode="HTML")
+            success += 1
+        except Exception: failed += 1
+
+    for target_id in all_targets:
+        if bot_id == MAIN_BOT_ID and (target_id in channel_ids or target_id == MAIN_CHANNEL): continue
+        try:
+            await bot.send_message(target_id, text, parse_mode="HTML", reply_markup=reply_markup)
+            success += 1
+            await asyncio.sleep(0.05)
+        except TelegramRetryAfter as e: await asyncio.sleep(e.retry_after)
+        except Exception: failed += 1
+    return success, failed
+
+async def ad_broadcaster():
+    while True:
+        await asyncio.sleep(10800)
+        ad_text = "🤖 Понравился этот бот?\n\nТы можешь абсолютно бесплатно создать точно такого же бота для своей группы или чата!\nПереходи в наш официальный канал, там можно создать своего бота и узнать все подробности:"
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🚀 Создать своего бота", url="https://t.me/L1meYT")],
+            [InlineKeyboardButton(text="👾 Discord с Карточным Ботом", url="https://discord.gg/6Xm595gP")]
+        ])
+        for b_id, b_instance in list(RUNNING_BOTS.items()):
+            if b_id != MAIN_BOT_ID:
+                try: await broadcast(b_instance, ad_text, reply_markup=markup)
+                except Exception: pass
+
+# === ЦЕНТРАЛЬНАЯ СИСТЕМА ВЫПАДЕНИЯ КАРТ + ПИТИ (ГАРАНТ) ===
+def roll_with_pity(conn, user_id: int, luck_mult: float = 1.0, force_rarity: str = None):
+    cursor = conn.cursor()
+    cursor.execute("SELECT rarity, counter FROM pity WHERE user_id = ?", (user_id,))
+    pity_data = {r: c for r, c in cursor.fetchall()}
+    
+    for r in PITY_THRESHOLDS:
+        pity_data[r] = pity_data.get(r, 0) + 1
+        
+    eff_force_rarity = force_rarity
+    if not eff_force_rarity:
+        for r, thresh in PITY_THRESHOLDS.items():
+            if pity_data[r] >= thresh:
+                eff_force_rarity = r
+                break
+                
+    if eff_force_rarity:
+        cursor.execute("SELECT card_id, photo_id, name, weight, rarity, damage, health, element, attack_type FROM cards WHERE rarity = ?", (eff_force_rarity,))
+        cards = cursor.fetchall()
+        if not cards: 
+            cursor.execute("SELECT card_id, photo_id, name, weight, rarity, damage, health, element, attack_type FROM cards")
+            cards = cursor.fetchall()
+    else:
+        cursor.execute("SELECT card_id, photo_id, name, weight, rarity, damage, health, element, attack_type FROM cards")
+        cards = cursor.fetchall()
+        
+    if not cards: return None
+        
+    weights = [(c[3] * luck_mult if luck_mult and c[4] != "⬜️Обычная⬜️" else c[3]) for c in cards]
+    chosen = random.choices(cards, weights=weights, k=1)[0]
+    
+    pulled_rarity = chosen[4]
+    if pulled_rarity in PITY_THRESHOLDS:
+        pity_data[pulled_rarity] = 0
+        
+    for r, c in pity_data.items():
+        cursor.execute("INSERT INTO pity (user_id, rarity, counter) VALUES (?, ?, ?) ON CONFLICT(user_id, rarity) DO UPDATE SET counter = ?", (user_id, r, c, c))
+        
+    cursor.execute("INSERT INTO inventory (user_id, card_id, amount, is_equipped) VALUES (?, ?, 1, 0) ON CONFLICT(user_id, card_id) DO UPDATE SET amount = inventory.amount + 1", (user_id, chosen[0]))
+    
+    return chosen
+
+# === ЛОГИКА МАГАЗИНА ПАКОВ ===
+def build_pack_shop_ui(bot_id: int):
+    shop = ACTIVE_PACK_SHOP.get(bot_id)
+    if not shop or not shop['active']: return "<b>🛍 Магазин паков закрыт! Обновление скоро...</b>", None
+    
+    lines = ["<b>🛍 Глобальный Магазин Паков</b>\n<i>Ассортимент обновится в ближайший по расписанию час...</i>\n"]
+    kb = []
+    
+    for p_id, p_data in PACKS_CONFIG.items():
+        stock = shop['stock'].get(p_id, 0)
+        lines.append(f"<b>📦 {p_data['name']}</b>")
+        lines.append(f"<b>💰 Цена: {p_data['price']} монет | 📦 В наличии: {stock} шт.</b>")
+        lines.append("<b>━━━━━━━━━━━━━━━━━━</b>")
+        if stock > 0:
+            kb.append([InlineKeyboardButton(text=f"Купить {p_data['name']} (💰{p_data['price']})", callback_data=f"buypack_{p_id}")])
+            
+    if all(s <= 0 for s in shop['stock'].values()):
+        lines.append("<b>🔴 Все паки распроданы!</b>")
+        
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=kb) if kb else None
+
+async def pack_shop_update_loop(bot: Bot, loop_id: float):
+    for _ in range(3600): 
+        await asyncio.sleep(3)
+        if bot.id not in ACTIVE_PACK_SHOP or not ACTIVE_PACK_SHOP[bot.id]['active'] or ACTIVE_PACK_SHOP[bot.id].get('loop_id') != loop_id: 
+            break
+        text, markup = build_pack_shop_ui(bot.id)
+        for chat_id, msg_id in ACTIVE_PACK_SHOP[bot.id]['messages']:
+            try: await bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, reply_markup=markup, parse_mode="HTML")
+            except TelegramRetryAfter as e: await asyncio.sleep(e.retry_after)
+            except Exception: pass
+            await asyncio.sleep(0.04)
+
+async def spawn_pack_shop(bot: Bot):
+    conn = get_db_connection(bot.id)
+    cursor = conn.cursor()
+    cursor.execute("SELECT chat_id, type FROM chats")
+    chats = cursor.fetchall()
+    cursor.execute("SELECT user_id FROM users WHERE is_banned = 0")
+    users = cursor.fetchall()
+    conn.close()
+    
+    # Фильтруем каналы из рассылки магазина (ОТПРАВЛЯЕМ ТОЛЬКО В ЛС И ГРУППЫ)
+    targets = set([c[0] for c in chats if c[1] != 'channel'] + [u[0] for u in users])
+    
+    if bot.id in ACTIVE_PACK_SHOP:
+        ACTIVE_PACK_SHOP[bot.id]['active'] = False
+        for chat_id, msg_id in ACTIVE_PACK_SHOP[bot.id]['messages']:
+            try: await bot.delete_message(chat_id, msg_id)
+            except: pass
+            await asyncio.sleep(0.04)
+            
+    pack_stock = {k: random.randint(v["stock"][0], v["stock"][1]) for k, v in PACKS_CONFIG.items()}
+    loop_id = time.time()
+    ACTIVE_PACK_SHOP[bot.id] = {'active': True, 'stock': pack_stock, 'messages': [], 'loop_id': loop_id}
+    
+    text, markup = build_pack_shop_ui(bot.id)
+    for target in targets:
+        try:
+            msg = await bot.send_message(target, text, reply_markup=markup, parse_mode="HTML")
+            ACTIVE_PACK_SHOP[bot.id]['messages'].append((target, msg.message_id))
+        except TelegramRetryAfter as e: await asyncio.sleep(e.retry_after)
+        except Exception: pass
+        await asyncio.sleep(0.04)
+        
+    asyncio.create_task(pack_shop_update_loop(bot, loop_id))
+
+async def pack_shop_spawner(bot: Bot):
+    MSK_TZ = timezone(timedelta(hours=3))
+    target_hours = [1, 4, 7, 10, 13, 16, 19, 22]
+    
+    while True:
+        now = datetime.now(MSK_TZ)
+        next_hour = None
+        
+        for h in target_hours:
+            if now.hour < h:
+                next_hour = h
+                break
+                
+        if next_hour is not None:
+            next_time = now.replace(hour=next_hour, minute=0, second=0, microsecond=0)
+        else:
+            next_time = (now + timedelta(days=1)).replace(hour=target_hours[0], minute=0, second=0, microsecond=0)
+            
+        sleep_seconds = (next_time - now).total_seconds()
+        
+        if sleep_seconds > 0:
+            await asyncio.sleep(sleep_seconds)
+            
+        await spawn_pack_shop(bot)
+        await asyncio.sleep(60)
+
+async def cmd_goshop(message: Message, bot: Bot, state: FSMContext):
+    await state.clear()
+    if not is_admin(message.from_user.id, bot.id): return
+    await spawn_pack_shop(bot)
+    await smart_reply(message, "✅ Магазин паков успешно обновлен и отправлен во все чаты! (Таймер автоматического обновления не сброшен)")
+
+async def process_buy_pack(callback: CallbackQuery, bot: Bot):
+    p_id = callback.data.split("buypack_")[1]
+    shop = ACTIVE_PACK_SHOP.get(bot.id)
+    if not shop or not shop['active'] or shop['stock'].get(p_id, 0) <= 0:
+        return await callback.answer("Пак недоступен или распродан!", show_alert=True)
+        
+    p_data = PACKS_CONFIG[p_id]
+    user_id = callback.from_user.id
+    
+    conn = get_db_connection(bot.id)
+    cursor = conn.cursor()
+    cursor.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
+    res = cursor.fetchone()
+    balance = res[0] if res else 0
+    
+    if balance < p_data['price']:
+        conn.close()
+        return await callback.answer("Недостаточно монет!", show_alert=True)
+        
+    shop['stock'][p_id] -= 1
+    cursor.execute("UPDATE users SET balance = ? WHERE user_id = ?", (balance - p_data['price'], user_id))
+    
+    pulled_cards = []
+    for _ in range(p_data['cards']):
+        chosen = roll_with_pity(conn, user_id, luck_mult=p_data['luck'], force_rarity=p_data['force_rarity'])
+        if chosen: pulled_cards.append(chosen)
+            
+    conn.commit()
+    conn.close()
+    
+    if pulled_cards:
+        if len(pulled_cards) > 10:
+            counts = {}
+            for c in pulled_cards:
+                key = (c[2], c[7], c[4], c[5], c[6], c[8] if len(c)>8 else '')
+                counts[key] = counts.get(key, 0) + 1
+                
+            lines = [f"🎉 <b>Ты открыл {p_data['name']} и получил:</b>\n"]
+            for (name, element, rarity, dmg, hp, atype), cnt in counts.items():
+                elem_str = fmt_el(element, atype)
+                lines.append(f"• <b>{cnt}x</b> {html.escape(name)} ({elem_str})\n  💎 {rarity} | ⚔️ {dmg} | ❤️ {hp}")
+                
+            msg_text = "\n\n".join(lines)
+            if len(msg_text) > 4000:
+                msg_text = msg_text[:3900] + "\n\n<i>...и множество других карт!</i>"
+            await smart_reply(callback.message, msg_text)
+        else:
+            lines = [f"🎉 <b>Ты открыл {p_data['name']} и получил:</b>\n"]
+            for idx, c in enumerate(pulled_cards, 1):
+                atype = c[8] if len(c)>8 else ''
+                elem_str = fmt_el(c[7], atype)
+                lines.append(f"{idx}. {html.escape(c[2])} ({elem_str})\n💎 Редкость • {c[4]}\n⚔️ Урон • {c[5]} | ❤️ Здоровье • {c[6]}")
+            await smart_reply(callback.message, "\n\n".join(lines))
+            
+        await callback.answer("Покупка успешна!", show_alert=False)
+    else:
+        await callback.answer("Ошибка базы данных карт!", show_alert=True)
+
+# === СОСТОЯНИЯ FSM И КЛАВИАТУРЫ ===
+class AddCardState(StatesGroup):
+    waiting_for_photo = State()
+    waiting_for_name = State()
+    waiting_for_weight = State()
+    waiting_for_rarity = State()
+    waiting_for_element = State()
+    waiting_for_attack_type = State()
+    waiting_for_damage = State()
+    waiting_for_health = State()
+
+def get_inline_rarities_kb():
+    kb, row = [], []
+    for r in RARITY_FRAME_COLORS.keys():
+        row.append(InlineKeyboardButton(text=r, callback_data=f"rarity_{r}"))
+        if len(row) == 2:
+            kb.append(row)
+            row = []
+    if row: kb.append(row)
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+def get_inline_elements_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔥", callback_data="element_🔥"), InlineKeyboardButton(text="💧", callback_data="element_💧"), InlineKeyboardButton(text="🌪", callback_data="element_🌪")],
+        [InlineKeyboardButton(text="🪵", callback_data="element_🪵"), InlineKeyboardButton(text="🔮", callback_data="element_🔮"), InlineKeyboardButton(text="☢️", callback_data="element_☢️")],
+        [InlineKeyboardButton(text="🪖", callback_data="element_🪖")]
+    ])
+
+def get_cards_delete_kb(cards_list):
+    keyboard = []
+    for card_id, name, rarity in cards_list:
+        keyboard.append([InlineKeyboardButton(text=f"{rarity} {name}", callback_data=f"delcard_{card_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+# ==========================================================
+# === ЛОГИКА КОМАНД БОТА ===
+# ==========================================================
+async def cmd_addbot(message: Message, bot: Bot, state: FSMContext):
+    await state.clear()
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2: return await smart_reply(message, "🛠 Создание своего бота\n\nИспользование: /addbot [токен_бота] (или /создатьбота)\n\n1. Перейди в @BotFather и создай нового бота.\n2. Скопируй токен.\n3. Отправь эту команду сюда вместе с токеном.")
+    token = args[1].strip()
+    try: new_bot_id = int(token.split(':')[0])
+    except ValueError: return await smart_reply(message, "❌ Неверный формат токена.")
+    if new_bot_id in RUNNING_BOTS: return await smart_reply(message, "❌ Этот бот уже запущен!")
+    test_bot = Bot(token=token)
+    try: me = await test_bot.get_me()
+    except Exception: return await smart_reply(message, "❌ Ошибка авторизации. Токен недействителен.")
+    finally: await test_bot.session.close()
+    
+    conn = get_db_connection(bot.id)
+    try:
+        conn.execute("INSERT INTO child_bots (bot_id, token, owner_id) VALUES (?, ?, ?)", (new_bot_id, token, message.from_user.id))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        return await smart_reply(message, "❌ Этот бот уже зарегистрирован в базе!")
+    conn.close()
+    asyncio.create_task(run_bot(token, message.from_user.id, is_startup=False))
+    await smart_reply(message, f"✅ Бот @{me.username} успешно создан и запущен!\nТы назначен его Главным Администратором.")
+
+async def cmd_globalmessage(message: Message, bot: Bot, state: FSMContext):
+    await state.clear()
+    if not is_admin(message.from_user.id, bot.id): return
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2: return await smart_reply(message, "Использование: /globalmessage (или /рассылка) [сообщение]")
+    await smart_reply(message, "⏳ Начинаю глобальную рассылку по всем чатам и личным сообщениям...")
+    success, failed = await broadcast(bot, f"📢 Глобальное уведомление:\n\n{args[1]}")
+    await smart_reply(message, f"✅ Рассылка успешно завершена!\nУспешно отправлено: {success}\nОшибок отправки: {failed}")
+
+async def cmd_addadmin(message: Message, bot: Bot, state: FSMContext):
+    await state.clear()
+    if not is_admin(message.from_user.id, bot.id): return
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2: return await smart_reply(message, "Использование: /addadmin (или /добавитьадмина) [id или @username]")
+    target_id = get_user_id_by_input(args[1], bot.id)
+    if not target_id: return await smart_reply(message, "Пользователь не найден в базе данных этого бота.")
+    conn = get_db_connection(bot.id)
+    conn.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?, ?)", (target_id,))
+    conn.commit()
+    conn.close()
+    await smart_reply(message, f"✅ Пользователь {args[1]} назначен администратором!")
+
+async def cmd_deladmin(message: Message, bot: Bot, state: FSMContext):
+    await state.clear()
+    if not is_admin(message.from_user.id, bot.id): return
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2: return await smart_reply(message, "Использование: /deladmin (или /удалитьадмина) [id или @username]")
+    target_id = get_user_id_by_input(args[1], bot.id)
+    if not target_id: return await smart_reply(message, "Пользователь не найден.")
+    if bot.id == MAIN_BOT_ID and target_id == MAIN_ADMIN_ID: return await smart_reply(message, "Нельзя удалить главного создателя!")
+    conn = get_db_connection(bot.id)
+    conn.execute("DELETE FROM admins WHERE user_id = ?", (target_id,))
+    conn.commit()
+    conn.close()
+    await smart_reply(message, f"✅ Пользователь {args[1]} удален из администраторов.")
+
+async def cmd_ban(message: Message, bot: Bot, state: FSMContext):
+    await state.clear()
+    if not is_admin(message.from_user.id, bot.id): return
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2: return await smart_reply(message, "Использование: /ban [id или @username]")
+    target_id = get_user_id_by_input(args[1], bot.id)
+    if not target_id: return await smart_reply(message, "Пользователь не найден.")
+    if is_admin(target_id, bot.id): return await smart_reply(message, "❌ Нельзя забанить администратора!")
+    conn = get_db_connection(bot.id)
+    conn.execute("UPDATE users SET is_banned = 1 WHERE user_id = ?", (target_id,))
+    conn.commit()
+    conn.close()
+    await smart_reply(message, f"✅ Пользователь {args[1]} навсегда забанен в боте.")
+    await notify_admins(bot, f"Администратор @{message.from_user.username} выдал блокировку пользователю {args[1]} (ID: {target_id}).")
+
+async def cmd_unban(message: Message, bot: Bot, state: FSMContext):
+    await state.clear()
+    if not is_admin(message.from_user.id, bot.id): return
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2: return await smart_reply(message, "Использование: /unban (или /разбан) [id или @username]")
+    target_id = get_user_id_by_input(args[1], bot.id)
+    if not target_id: return await smart_reply(message, "Пользователь не найден.")
+    conn = get_db_connection(bot.id)
+    conn.execute("UPDATE users SET is_banned = 0 WHERE user_id = ?", (target_id,))
+    conn.commit()
+    conn.close()
+    await smart_reply(message, f"✅ Пользователь {args[1]} разбанен в боте.")
+    await notify_admins(bot, f"Администратор @{message.from_user.username} снял блокировку с пользователя {args[1]} (ID: {target_id}).")
+
+async def cmd_getmoney(message: Message, bot: Bot, state: FSMContext):
+    await state.clear()
+    if not is_admin(message.from_user.id, bot.id): return
+    args = message.text.split(maxsplit=2)
+    if len(args) < 3: return await smart_reply(message, "Использование: /getmoney [число] [id или @username]")
+    try: amount = int(args[1])
+    except ValueError: return await smart_reply(message, "Число монет должно быть целым.")
+    target_id = get_user_id_by_input(args[2], bot.id)
+    if not target_id: return await smart_reply(message, "Пользователь не найден.")
+    conn = get_db_connection(bot.id)
+    conn.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (amount, target_id))
+    conn.commit()
+    conn.close()
+    await smart_reply(message, f"✅ Успешно добавлено {amount} монет пользователю {args[2]}.")
+    await notify_admins(bot, f"Администратор @{message.from_user.username} накрутил {amount} монет пользователю {args[2]} (ID: {target_id}).")
+
+async def cmd_gettrophies(message: Message, bot: Bot, state: FSMContext):
+    await state.clear()
+    if not is_admin(message.from_user.id, bot.id): return
+    args = message.text.split(maxsplit=2)
+    if len(args) < 3: return await smart_reply(message, "Использование: /gettrophies [число] [id или @username]")
+    try: amount = int(args[1])
+    except ValueError: return await smart_reply(message, "Число трофеев должно быть целым.")
+    target_id = get_user_id_by_input(args[2], bot.id)
+    if not target_id: return await smart_reply(message, "Пользователь не найден.")
+    conn = get_db_connection(bot.id)
+    conn.execute("UPDATE users SET trophies = trophies + ? WHERE user_id = ?", (amount, target_id))
+    conn.commit()
+    conn.close()
+    await smart_reply(message, f"✅ Успешно добавлено {amount} трофеев пользователю {args[2]}.")
+    await notify_admins(bot, f"Администратор @{message.from_user.username} накрутил {amount} трофеев пользователю {args[2]} (ID: {target_id}).")
+
+async def cmd_events(message: Message, bot: Bot, state: FSMContext):
+    await state.clear()
+    if not is_admin(message.from_user.id, bot.id): return
+    cmd = message.text.split()[0].lower()
+    args = message.text.split()[1:]
+    if len(args) < 2: return await smart_reply(message, f"Использование: {cmd} [множитель] [время в минутах]")
+    try: multiplier, minutes = float(args[0]), int(args[1])
+    except ValueError: return await smart_reply(message, "Множитель и время должны быть числами!")
+    
+    event_map = {
+        "/luckevent": ("luck", "🍀 Активирован эвент УДАЧИ!\nШанс на выпадение редких карт увеличен в"), 
+        "/эвентудачи": ("luck", "🍀 Активирован эвент УДАЧИ!\nШанс на выпадение редких карт увеличен в"), 
+        "/cooldownevent": ("cooldown", "⏳ Активирован эвент СКОРОСТИ!\nВремя перезарядки карт уменьшено в"),
+        "/эвентскорости": ("cooldown", "⏳ Активирован эвент СКОРОСТИ!\nВремя перезарядки карт уменьшено в")
+    }
+    
+    if cmd not in event_map: return
+    ev_type, ev_text = event_map[cmd]
+    set_event(ev_type, multiplier, minutes, bot.id)
+    await smart_reply(message, f"✅ Эвент {ev_type} успешно запущен. Начинаю рассылку...")
+    asyncio.create_task(broadcast(bot, f"{ev_text} {multiplier}x на {minutes} минут!"))
+
+async def cmd_events_space(message: Message, bot: Bot, state: FSMContext):
+    await state.clear()
+    if not is_admin(message.from_user.id, bot.id): return
+    parts = message.text.split()
+    if len(parts) < 4: return await smart_reply(message, "Ошибка формата. Пример: /cooldown event 2 60")
+    cmd = parts[0]
+    try: multiplier, minutes = float(parts[2]), int(parts[3])
+    except ValueError: return await smart_reply(message, "Множитель и время должны быть числами!")
+    if cmd == "/cooldown":
+        set_event("cooldown", multiplier, minutes, bot.id)
+        text = f"⏳ Активирован эвент СКОРОСТИ!\nВремя перезарядки карт уменьшено в {multiplier}x на {minutes} минут!"
+        await smart_reply(message, "✅ Эвент запущен. Начинаю рассылку...")
+        asyncio.create_task(broadcast(bot, text))
+
+# === СОЗДАНИЕ КАРТЫ (FSM) ===
+async def start_add_card(message: Message, state: FSMContext, bot: Bot):
+    if not is_admin(message.from_user.id, bot.id): return
+    await message.answer("<b>📸 Отправь фото карты:</b>", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Отмена")]], resize_keyboard=True), parse_mode="HTML")
+    await state.set_state(AddCardState.waiting_for_photo)
+
+async def cancel_action(message: Message, state: FSMContext, bot: Bot):
+    await state.clear()
+    await message.answer("<b>Действие отменено.</b>", reply_markup=get_main_kb(is_admin(message.from_user.id, bot.id)), parse_mode="HTML")
+
+async def process_photo(message: Message, state: FSMContext):
+    await state.update_data(photo_id=message.photo[-1].file_id)
+    await message.answer("<b>📝 Введи название:</b>", parse_mode="HTML")
+    await state.set_state(AddCardState.waiting_for_name)
+
+async def process_name(message: Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await message.answer("<b>⚖️ Введи шанс выпадения (вес):</b>", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Отмена")]], resize_keyboard=True), parse_mode="HTML")
+    await state.set_state(AddCardState.waiting_for_weight)
+
+async def process_weight(message: Message, state: FSMContext):
+    try: weight = float(message.text.replace(",", "."))
+    except ValueError: return await message.answer("<b>Вес должен быть числом! Попробуй еще раз:</b>", parse_mode="HTML")
+    await state.update_data(weight=weight)
+    await message.answer("<b>💎 Выбери редкость:</b>", reply_markup=get_inline_rarities_kb(), parse_mode="HTML")
+    await state.set_state(AddCardState.waiting_for_rarity)
+
+async def process_rarity(callback: CallbackQuery, state: FSMContext):
+    rarity = callback.data.split("rarity_")[1]
+    if rarity not in RARITY_FRAME_COLORS: return await callback.answer("Ошибка! Неизвестная редкость.", show_alert=True)
+    await state.update_data(rarity=rarity)
+    try: await callback.message.edit_text(f"<b>💎 Выбрана редкость: {rarity}</b>", parse_mode="HTML")
+    except TelegramBadRequest: pass
+    text = (
+        "⚡️ Выбери элемент карты:\n\n"
+        "Таблица преимуществ:\n"
+        "💧 &gt; 🔥, ☢️, 🪖\n"
+        "🔥 &gt; 🪵, 🔮, 🪖\n"
+        "🌪 &gt; 🔥, ☢️, 🪖\n"
+        "🪵 &gt; 🌪, 💧, 🪖\n"
+        "☢️ &gt; 🪵, 🔮, 🪖\n"
+        "🔮 &gt; 💧, 🪖\n"
+        "🪖 &lt; Проигрывает всем"
+    )
+    await callback.message.answer(f"<b>{text}</b>", reply_markup=get_inline_elements_kb(), parse_mode="HTML")
+    await state.set_state(AddCardState.waiting_for_element)
+    await callback.answer()
+
+async def process_element(callback: CallbackQuery, state: FSMContext):
+    element = callback.data.split("element_")[1]
+    await state.update_data(element=element)
+    try: await callback.message.edit_text(f"<b>⚡️ Выбран элемент: {element}</b>", parse_mode="HTML")
+    except TelegramBadRequest: pass
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛜AOE🛜", callback_data="atype_🛜AOE🛜")],
+        [InlineKeyboardButton(text="💥SPLASH💥", callback_data="atype_💥SPLASH💥")],
+        [InlineKeyboardButton(text="🔥FIRE🔥", callback_data="atype_🔥FIRE🔥")],
+        [InlineKeyboardButton(text="Пропустить", callback_data="atype_none")]
+    ])
+    await callback.message.answer("<b>🗡 Выбери тип атаки (или пропусти для обычной):</b>", reply_markup=kb, parse_mode="HTML")
+    await state.set_state(AddCardState.waiting_for_attack_type)
+    await callback.answer()
+
+async def process_attack_type(callback: CallbackQuery, state: FSMContext):
+    atype = callback.data.split("atype_")[1]
+    if atype == "none": atype = ""
+    await state.update_data(attack_type=atype)
+    try: await callback.message.edit_text(f"<b>🗡 Тип атаки: {atype if atype else 'Обычная'}</b>", parse_mode="HTML")
+    except TelegramBadRequest: pass
+    
+    await callback.message.answer("<b>⚔️ Введи урон:</b>", reply_markup=ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Отмена")]], resize_keyboard=True), parse_mode="HTML")
+    await state.set_state(AddCardState.waiting_for_damage)
+    await callback.answer()
+
+async def process_damage(message: Message, state: FSMContext):
+    if not message.text.isdigit(): return await message.answer("<b>Урон должен быть целым числом! Попробуй еще раз:</b>", parse_mode="HTML")
+    await state.update_data(damage=int(message.text))
+    await message.answer("<b>❤️ Введи здоровье:</b>", parse_mode="HTML")
+    await state.set_state(AddCardState.waiting_for_health)
+
+async def process_health(message: Message, state: FSMContext, bot: Bot):
+    if not message.text.isdigit(): return await message.answer("<b>Здоровье должно быть целым числом! Попробуй еще раз:</b>", parse_mode="HTML")
+    health = int(message.text)
+    data = await state.get_data()
+    atype = data.get('attack_type', '')
+    
+    conn = get_db_connection(bot.id)
+    cursor = conn.cursor()
+    cursor.execute('INSERT INTO cards (photo_id, name, weight, rarity, damage, health, element, attack_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', 
+                   (data['photo_id'], data['name'], data['weight'], data['rarity'], data['damage'], health, data['element'], atype))
+    conn.commit()
+    cursor.execute("SELECT user_id FROM admins")
+    admins = cursor.fetchall()
+    conn.close()
+    
+    elem_str = fmt_el(data['element'], atype)
+    
+    await message.answer(f"<b>✅ Карта «{data['name']} ({elem_str})» добавлена!\n⚖️ Вес: {data['weight']}\n💎 Редкость: {data['rarity']}\n⚔️ Урон: {data['damage']}\n❤️ Здоровье: {health}</b>", reply_markup=get_main_kb(True), parse_mode="HTML")
+    await state.clear()
+
+    admin_mention = f"@{message.from_user.username}" if message.from_user.username else html.escape(message.from_user.first_name)
+    notify_text = f"<b>🔔 Создана новая карта!\nАвтор: {admin_mention}\n\n🃏 {html.escape(data['name'])} ({elem_str})\n⚖️ Вес: {data['weight']}\n💎 Редкость: {data['rarity']}\n⚔️ Урон: {data['damage']}\n❤️ Здоровье: {health}</b>"
+
+    for (adm_id,) in admins:
+        if adm_id != message.from_user.id:
+            try: await bot.send_photo(adm_id, photo=data['photo_id'], caption=notify_text, parse_mode="HTML")
+            except TelegramRetryAfter as e: await asyncio.sleep(e.retry_after)
+            except Exception: pass
+            await asyncio.sleep(0.05)
+
+async def invalid_fsm_input(message: Message):
+    await message.answer("<b>⚠️ Неверный формат данных!\nПожалуйста, отправь то, что требует бот на этом шаге (текст, число, фото или нажми на кнопку). Или нажми «Отмена».</b>", parse_mode="HTML")
+
+async def start_delete_card(message: Message, bot: Bot, state: FSMContext):
+    await state.clear()
+    if not is_admin(message.from_user.id, bot.id): return
+    conn = get_db_connection(bot.id)
+    cards = conn.execute("SELECT card_id, name, rarity FROM cards").fetchall()
+    conn.close()
+    if not cards: return await message.answer("<b>В базе пока нет добавленных карт.</b>", parse_mode="HTML")
+    await message.answer("<b>Нажми на карту, чтобы удалить её навсегда:</b>", reply_markup=get_cards_delete_kb(cards), parse_mode="HTML")
+
+async def process_delete_card(callback: CallbackQuery, bot: Bot, state: FSMContext):
+    await state.clear()
+    if not is_admin(callback.from_user.id, bot.id): return await callback.answer("У вас нет прав!", show_alert=True)
+    card_id = int(callback.data.split("_")[1])
+    conn = get_db_connection(bot.id)
+    conn.execute("DELETE FROM cards WHERE card_id = ?", (card_id,))
+    conn.execute("DELETE FROM inventory WHERE card_id = ?", (card_id,))
+    conn.commit()
+    conn.close()
+    await callback.answer("Карта удалена!", show_alert=True)
+    new_keyboard = [[btn for btn in row if btn.callback_data != callback.data] for row in callback.message.reply_markup.inline_keyboard]
+    new_keyboard = [row for row in new_keyboard if row]
+    if new_keyboard:
+        try: await callback.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=new_keyboard))
+        except TelegramBadRequest: pass
+    else:
+        await callback.message.edit_text("<b>✅ Все карты из этого списка были удалены.</b>", parse_mode="HTML")
+
+async def cmd_start(message: Message, bot: Bot, state: FSMContext):
+    await state.clear()
+    adm = is_admin(message.from_user.id, bot.id)
+    if adm and message.chat.type == "private": 
+        await smart_reply(message, "Добро пожаловать в панель администратора!\nВведите /help (или /помощь) для просмотра всех команд.", reply_markup=get_main_kb(adm))
+    else: 
+        await smart_reply(message, "Привет! Я карточный бот.\nИспользуй кнопку в меню, чтобы испытать удачу и выбить карту!\nСписок всех команд: /help", reply_markup=get_main_kb(adm) if message.chat.type == "private" else None)
+
+async def cmd_help(message: Message, bot: Bot, state: FSMContext):
+    await state.clear()
+    user_text = (
+        "📜 Список доступных команд:\n\n"
+        "🎮 Основные:\n"
+        "• /start (или /старт) — Перезапустить бота\n"
+        "• /help (или /помощь) — Показать это меню\n"
+        "• /getcard (или /карта) — Выбить случайную карту\n"
+        "• /inventory (или /инвентарь) — Твои собранные карты\n"
+        "• /equip (или /экипировка) — Управление экипировкой\n"
+        "• /duel (или /дуэль) — Вызвать игрока на бой (в группе)\n"
+        "• /pvpsearch (или /поиск) — Найти случайного противника (в ЛС)\n"
+        "• /top (или /топ) — Топ 20 лучших игроков по кубкам\n"
+        "• /topmoney (или /топденьги) — Топ 20 самых богатых игроков\n"
+        "• /index (или /индекс) — Посмотреть индекс всех карт\n"
+        "• /profile (или /профиль) — Посмотреть свой профиль\n"
+        "• /elements (или /элементы) — Таблица преимуществ стихий\n"
+    )
+    admin_text = (
+        "\n👑 Для администраторов:\n"
+        "• /goshop (или /обновитьмагазин) — Обновить магазин паков\n"
+        "• /ban [id/@] — Навсегда забанить игрока\n"
+        "• /unban (или /разбан) [id/@] — Разбанить игрока\n"
+        "• /getmoney [число] [id/@] — Выдать монеты\n"
+        "• /gettrophies [число] [id/@] — Выдать трофеи\n"
+        "• /addadmin (или /добавитьадмина) [id/@] — Выдать админку\n"
+        "• /deladmin (или /удалитьадмина) [id/@] — Забрать админку\n"
+        "• /globalmessage (или /рассылка) [текст] — Рассылка\n"
+        "• /luckevent (или /эвентудачи) [множ] [мин] — Эвент УДАЧИ\n"
+        "• /cooldownevent (или /эвентскорости) [множ] [мин] — Эвент СКОРОСТИ\n\n"
+        "(Кнопки «Добавить карту» и «Удалить карту» доступны в панели /start)"
+    )
+    if is_admin(message.from_user.id, bot.id): await smart_reply(message, user_text + admin_text)
+    else: await smart_reply(message, user_text)
+
+async def cmd_elements(message: Message, bot: Bot, state: FSMContext):
+    await state.clear()
+    text = (
+        "Таблица преимуществ элементов:\n\n"
+        "💧 Вода &gt; 🔥 Огонь, ☢️ Радиация, 🪖 Каска\n"
+        "🔥 Огонь &gt; 🪵 Дерево, 🔮 Магия, 🪖 Каска\n"
+        "🌪 Ветер &gt; 🔥 Огонь, ☢️ Радиация, 🪖 Каска\n"
+        "🪵 Дерево &gt; 🌪 Ветер, 💧 Вода, 🪖 Каска\n"
+        "☢️ Радиация &gt; 🪵 Дерево, 🔮 Магия, 🪖 Каска\n"
+        "🔮 Магия &gt; 💧 Вода, 🪖 Каска\n"
+        "🪖 Каска &lt; Проигрывает всем\n\n"
+        "<i>💡 Атакующий наносит +20% урона по слабому элементу (или получает штраф урона, если бьет по сопротивлению).</i>"
+    )
+    await smart_reply(message, text, parse_mode="HTML")
+
+async def cmd_top(message: Message, bot: Bot, state: FSMContext):
+    await state.clear()
+    conn = get_db_connection(bot.id)
+    top_users = conn.execute("SELECT username, user_id, trophies FROM users WHERE trophies > 0 AND user_id NOT IN (SELECT user_id FROM admins) ORDER BY trophies DESC LIMIT 20").fetchall()
+    conn.close()
+    if not top_users: return await smart_reply(message, "🏆 В топе пока никого нет. Вызови кого-нибудь на дуэль и стань первым!")
+    lines = ["🏆 Топ 20 игроков по трофеям:\n"]
+    for idx, (username, uid, trophies) in enumerate(top_users, 1): 
+        display_name = f"@{username}" if username else f"ID: {uid}"
+        lines.append(f"{idx}. {html.escape(display_name)} — {trophies} 🏆")
+    await smart_reply(message, "\n".join(lines))
+
+async def cmd_topmoney(message: Message, bot: Bot, state: FSMContext):
+    await state.clear()
+    conn = get_db_connection(bot.id)
+    top_users = conn.execute("SELECT username, user_id, balance FROM users WHERE balance > 0 AND user_id NOT IN (SELECT user_id FROM admins) ORDER BY balance DESC LIMIT 20").fetchall()
+    conn.close()
+    if not top_users: return await smart_reply(message, "💰 В топе пока никого нет.")
+    lines = ["💰 Топ 20 игроков по монетам:\n"]
+    for idx, (username, uid, balance) in enumerate(top_users, 1): 
+        display_name = f"@{username}" if username else f"ID: {uid}"
+        lines.append(f"{idx}. {html.escape(display_name)} — {balance} 💰")
+    await smart_reply(message, "\n".join(lines))
+
+async def cmd_profile(message: Message, bot: Bot, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    conn = get_db_connection(bot.id)
+    res = conn.execute("SELECT trophies, balance FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    trophies, balance = (res[0], res[1]) if res else (0, 0)
+    unlocked_cards = conn.execute("SELECT COUNT(card_id) FROM inventory WHERE user_id = ? AND amount > 0", (user_id,)).fetchone()[0]
+    total_cards = conn.execute("SELECT COUNT(card_id) FROM cards").fetchone()[0]
+    conn.close()
+    mention = f"@{message.from_user.username}" if message.from_user.username else html.escape(message.from_user.first_name)
+    rank_name = get_rank_name(get_mm_category(trophies))
+    await smart_reply(message, f"👤 Профиль игрока {mention}\n\n🏅 Ранг: <b>{rank_name}</b>\n💳 Твой ID: {user_id}\n💰 Монеты: {balance}\n🏆 Трофеи: {trophies}\n🎒 Открыто карт: {unlocked_cards}/{total_cards}\n\n💡 Участвуй в битвах, чтобы повышать Ранг и зарабатывать монеты для Магазина Паков!")
+
+async def cmd_getcard(message: Message, bot: Bot, state: FSMContext):
+    await state.clear()
+    user_id = message.from_user.id
+    current_time = int(time.time())
+    conn = get_db_connection(bot.id)
+    cursor = conn.cursor()
+    cursor.execute("SELECT last_getcard FROM users WHERE user_id = ?", (user_id,))
+    user_data = cursor.fetchone()
+    
+    active_cooldown = COOLDOWN_SECONDS
+    cd_mult = get_active_event("cooldown", bot.id)
+    if cd_mult and cd_mult > 0: active_cooldown = int(COOLDOWN_SECONDS / cd_mult)
+        
+    time_passed = current_time - (user_data[0] if user_data else 0)
+    if time_passed < active_cooldown:
+        remaining = active_cooldown - time_passed
+        await smart_reply(message, f"⏳ Карты перезаряжаются.\nПодожди еще {remaining // 60} мин {remaining % 60} сек.")
+        conn.close()
+        return
+        
+    luck_mult = get_active_event("luck", bot.id)
+    chosen = roll_with_pity(conn, user_id, luck_mult=luck_mult if luck_mult else 1.0)
+    
+    if not chosen:
+        await smart_reply(message, "Бот пока пуст. Администратор еще не добавил карты!")
+        conn.close()
+        return
+        
+    cursor.execute("SELECT amount FROM inventory WHERE user_id = ? AND card_id = ?", (user_id, chosen[0]))
+    is_new = not cursor.fetchone()
+    
+    atype = chosen[8] if len(chosen) > 8 else ''
+    elem_str = fmt_el(chosen[7], atype)
+    display_name = f"{html.escape(chosen[2])} ({elem_str})" + (" 🔥NEW🔥" if is_new else "")
+    
+    cursor.execute("UPDATE users SET last_getcard = ? WHERE user_id = ?", (current_time, user_id))
+    conn.commit()
+    conn.close()
+    
+    mention = f"@{message.from_user.username}" if message.from_user.username else html.escape(message.from_user.first_name)
+    caption = f"🎉 {mention}, тебе выпала карта!\n\n🃏 {display_name}\n💎 Редкость • {chosen[4]}\n⚔️ Урон • {chosen[5]}\n❤️ Здоровье • {chosen[6]}"
+    
+    try:
+        photo_bytes = BytesIO()
+        file = await bot.get_file(chosen[1])
+        await bot.download_file(file.file_path, photo_bytes)
+        photo_bytes.seek(0)
+        framed = await apply_frame(photo_bytes, chosen[4])
+        await smart_reply(message, text=caption, photo=framed)
+    except Exception as e: 
+        logging.error(f"Frame build error: {e}")
+        await smart_reply(message, text=caption, photo=chosen[1])
+
+# --- ИНДЕКС ---
+async def get_index_page(bot_id: int, user_id: int, page: int = 1):
+    conn = get_db_connection(bot_id)
+    cursor = conn.cursor()
+    cursor.execute("SELECT card_id, name, weight, rarity, damage, health, element, attack_type FROM cards ORDER BY weight DESC")
+    cards = cursor.fetchall()
+    if not cards:
+        conn.close()
+        return "<b>📭 В игре пока нет ни одной добавленной карты.</b>", None
+        
+    total_weight = sum(c[2] for c in cards)
+    unlocked_ids = {row[0] for row in cursor.execute("SELECT card_id FROM inventory WHERE user_id = ? AND amount > 0", (user_id,)).fetchall()}
+    exists_dict = {row[0]: row[1] for row in cursor.execute("SELECT card_id, SUM(amount) FROM inventory GROUP BY card_id").fetchall()}
+    conn.close()
+    
+    PER_PAGE = 7
+    total_pages = (len(cards) + PER_PAGE - 1) // PER_PAGE
+    page = max(1, min(page, total_pages))
+    
+    lines = [f"📖 Индекс всех карт (Страница {page}/{total_pages})\n"]
+    for idx, card in enumerate(cards[(page-1)*PER_PAGE : page*PER_PAGE], start=(page-1)*PER_PAGE + 1):
+        chance_pct = (card[2] / total_weight) * 100 if total_weight > 0 else 0
+        atype = card[7] if len(card)>7 else ''
+        elem_str = fmt_el(card[6], atype)
+        display_name = f"{html.escape(card[1])} ({elem_str})" if card[0] in unlocked_ids else "???"
+        lines.append(f"{idx}. {display_name}\n💎 {card[3]} | 🎲 {chance_pct:.2f}%\n⚔️ Урон • {card[4]} | ❤️ Здоровье • {card[5]}\n💫 Существует • {exists_dict.get(card[0], 0)} 💫\n━━━━━━━━━━━━━━━━━━")
+        
+    kb, nav = [], []
+    if page > 1: nav.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"index_page_{page-1}_{user_id}"))
+    if page < total_pages: nav.append(InlineKeyboardButton(text="Вперед ▶️", callback_data=f"index_page_{page+1}_{user_id}"))
+    if nav: kb.append(nav)
+    return "<b>" + "\n".join(lines) + "</b>", InlineKeyboardMarkup(inline_keyboard=kb) if kb else None
+
+async def cmd_index(message: Message, bot: Bot, state: FSMContext):
+    await state.clear()
+    text, markup = await get_index_page(bot.id, message.from_user.id, 1)
+    await smart_reply(message, text.replace('<b>','').replace('</b>',''), reply_markup=markup)
+
+async def process_index_page(callback: CallbackQuery, bot: Bot):
+    parts = callback.data.split("_")
+    page, owner_id = int(parts[2]), int(parts[3])
+    if callback.from_user.id != owner_id: return await callback.answer("Это не твой индекс!", show_alert=True)
+    text, markup = await get_index_page(bot.id, owner_id, page)
+    try: await callback.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+    except: pass
+    await callback.answer()
+
+# --- ИНВЕНТАРЬ ---
+async def get_inventory_page(bot_id: int, user_id: int, page: int = 1):
+    conn = get_db_connection(bot_id)
+    cursor = conn.cursor()
+    cursor.execute("SELECT c.card_id, c.name, c.rarity, c.damage, c.health, i.amount, i.is_equipped, c.element, c.attack_type FROM inventory i JOIN cards c ON i.card_id = c.card_id WHERE i.user_id = ? AND i.amount > 0 ORDER BY c.weight DESC", (user_id,))
+    cards = cursor.fetchall()
+    conn.close()
+
+    if not cards: return "<b>📭 Твой инвентарь пуст. Используй кнопку Выбить карту!</b>", None
+    PER_PAGE = 7
+    total_pages = (len(cards) + PER_PAGE - 1) // PER_PAGE
+    page = max(1, min(page, total_pages))
+
+    lines = [f"🎒 Твой инвентарь (Страница {page}/{total_pages})\n"]
+    for idx, card in enumerate(cards[(page-1)*PER_PAGE : page*PER_PAGE], start=(page-1)*PER_PAGE + 1):
+        atype = card[8] if len(card)>8 else ''
+        elem_str = fmt_el(card[7], atype)
+        lines.append(f"{idx}. {html.escape(card[1])} ({elem_str}){' ✅(Надето)' if card[6] else ''}\n💎 {card[2]} | 📦 {card[5]}\n⚔️ {card[3]} | ❤️ {card[4]}\n━━━━━━━━━━━━━━━━━━")
+
+    kb, nav = [], []
+    if page > 1: nav.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"inv_page_{page-1}_{user_id}"))
+    if page < total_pages: nav.append(InlineKeyboardButton(text="Вперед ▶️", callback_data=f"inv_page_{page+1}_{user_id}"))
+    if nav: kb.append(nav)
+    kb.append([InlineKeyboardButton(text="🛡 Экипировка", callback_data=f"open_equip_{user_id}")])
+    return "<b>" + "\n".join(lines) + "</b>", InlineKeyboardMarkup(inline_keyboard=kb)
+
+async def cmd_inventory(message: Message, bot: Bot, state: FSMContext):
+    await state.clear()
+    text, markup = await get_inventory_page(bot.id, message.from_user.id, 1)
+    await smart_reply(message, text.replace('<b>','').replace('</b>',''), reply_markup=markup)
+
+async def process_inv_page(callback: CallbackQuery, bot: Bot):
+    parts = callback.data.split("_")
+    page, owner_id = int(parts[2]), int(parts[3])
+    if callback.from_user.id != owner_id: return await callback.answer("Это не твой инвентарь!", show_alert=True)
+    text, markup = await get_inventory_page(bot.id, callback.from_user.id, page)
+    try: await callback.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+    except TelegramBadRequest: pass
+    except TelegramRetryAfter as e: await asyncio.sleep(e.retry_after)
+    await callback.answer()
+
+# --- ЭКИПИРОВКА ---
+async def get_equip_menu(bot_id: int, user_id: int, viewer_id: int = None):
+    conn = get_db_connection(bot_id)
+    equipped = conn.execute("SELECT c.name, c.rarity, c.damage, c.health, c.element, c.attack_type FROM inventory i JOIN cards c ON i.card_id = c.card_id WHERE i.user_id = ? AND i.is_equipped = 1", (user_id,)).fetchall()
+    
+    target_name = ""
+    if viewer_id and viewer_id != user_id:
+        res = conn.execute("SELECT username FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        if res and res[0]: target_name = f"@{res[0]}"
+        else: target_name = f"ID: {user_id}"
+    conn.close()
+
+    if viewer_id and viewer_id != user_id:
+        lines = [f"🛡 Экипировка {html.escape(target_name)}:\n"]
+    else:
+        lines = ["🛡 Твоя экипировка (макс. 3 карты):\n"]
+
+    if not equipped:
+        lines.append("Ничего не надето.\n")
+        total_dmg, total_hp = 0, 0
+    else:
+        for idx, c in enumerate(equipped, 1): 
+            atype = c[5] if len(c)>5 else ''
+            elem_str = fmt_el(c[4], atype)
+            lines.append(f"{idx}. {html.escape(c[0])} ({elem_str})\n⚔️ {c[2]} | ❤️ {c[3]} | 💎 {c[1].split('⬜️')[0].strip('🟩🟦🟪🟨🟥🔵🟣')}")
+        lines.append("")
+        total_dmg = sum(c[2] for c in equipped)
+        total_hp = sum(c[3] for c in equipped)
+
+    lines.append(f"📊 Общие характеристики:\n⚔️ Урон: {total_dmg}\n❤️ Здоровье: {total_hp}")
+    
+    if viewer_id and viewer_id != user_id:
+        return "<b>" + "\n".join(lines) + "</b>", None
+    else:
+        kb = [
+            [InlineKeyboardButton(text="🗂 Экипировать карты", callback_data=f"equip_select_1_{user_id}")],
+            [InlineKeyboardButton(text="🌟 Экипировать лучшие", callback_data=f"equip_auto_{user_id}")],
+            [InlineKeyboardButton(text="❌ Снять все", callback_data=f"equip_clear_{user_id}")],
+            [InlineKeyboardButton(text="🔙 В инвентарь", callback_data=f"inv_page_1_{user_id}")]
+        ]
+        return "<b>" + "\n".join(lines) + "</b>", InlineKeyboardMarkup(inline_keyboard=kb)
+
+async def cmd_equip(message: Message, bot: Bot, state: FSMContext):
+    await state.clear()
+    if message.reply_to_message:
+        target_user_id = message.reply_to_message.from_user.id
+        text, markup = await get_equip_menu(bot.id, target_user_id, viewer_id=message.from_user.id)
+    else:
+        text, markup = await get_equip_menu(bot.id, message.from_user.id)
+    await smart_reply(message, text.replace('<b>','').replace('</b>',''), reply_markup=markup)
+
+async def process_open_equip(callback: CallbackQuery, bot: Bot):
+    owner_id = int(callback.data.split("_")[2])
+    if callback.from_user.id != owner_id: return await callback.answer("Это не твоя экипировка!", show_alert=True)
+    text, markup = await get_equip_menu(bot.id, callback.from_user.id)
+    try: await callback.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+    except: pass
+    await callback.answer()
+
+async def get_equip_select_page(bot_id: int, user_id: int, page: int = 1):
+    conn = get_db_connection(bot_id)
+    cards = conn.execute("SELECT c.card_id, c.name, i.is_equipped, c.damage, c.health, c.element, c.attack_type FROM inventory i JOIN cards c ON i.card_id = c.card_id WHERE i.user_id = ? AND i.amount > 0 ORDER BY (c.damage + c.health) DESC", (user_id,)).fetchall()
+    conn.close()
+
+    if not cards: return "<b>📭 У тебя нет карт для экипировки.</b>", InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data=f"open_equip_{user_id}")]])
+
+    PER_PAGE = 8
+    total_pages = (len(cards) + PER_PAGE - 1) // PER_PAGE
+    page = max(1, min(page, total_pages))
+
+    text = f"<b>🗂 Выбери карту (Страница {page}/{total_pages}):\n(Можно надеть максимум 3 разные карты)</b>"
+    kb = []
+    for c_id, c_name, is_equipped, dmg, hp, el, atype in cards[(page-1)*PER_PAGE : page*PER_PAGE]:
+        elem_str = fmt_el(el, atype)
+        kb.append([InlineKeyboardButton(text=f"{'✅ ' if is_equipped else ''}{html.escape(c_name)}({elem_str}) ⚔️{dmg} ❤️{hp}", callback_data=f"eqcard_{c_id}_{user_id}")])
+
+    nav_row = []
+    if page > 1: nav_row.append(InlineKeyboardButton(text="◀️", callback_data=f"equip_select_{page-1}_{user_id}"))
+    if page < total_pages: nav_row.append(InlineKeyboardButton(text="▶️", callback_data=f"equip_select_{page+1}_{user_id}"))
+    if nav_row: kb.append(nav_row)
+    kb.append([InlineKeyboardButton(text="🔙 Вернуться", callback_data=f"open_equip_{user_id}")])
+    return text, InlineKeyboardMarkup(inline_keyboard=kb)
+
+async def process_equip_select(callback: CallbackQuery, bot: Bot):
+    parts = callback.data.split("_")
+    page, owner_id = int(parts[2]), int(parts[3])
+    if callback.from_user.id != owner_id: return await callback.answer("Это не твоя экипировка!", show_alert=True)
+    text, markup = await get_equip_select_page(bot.id, callback.from_user.id, page)
+    try: await callback.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+    except: pass
+    await callback.answer()
+
+async def process_equip_card(callback: CallbackQuery, bot: Bot):
+    parts = callback.data.split("_")
+    card_id, owner_id = int(parts[1]), int(parts[2])
+    if callback.from_user.id != owner_id: return await callback.answer("Это не твоя экипировка!", show_alert=True)
+    
+    user_id = callback.from_user.id
+    conn = get_db_connection(bot.id)
+    res = conn.execute("SELECT is_equipped FROM inventory WHERE user_id = ? AND card_id = ?", (user_id, card_id)).fetchone()
+    
+    if not res:
+        conn.close()
+        return await callback.answer("Ошибка: карта не найдена.")
+
+    if res[0]:
+        conn.execute("UPDATE inventory SET is_equipped = 0 WHERE user_id = ? AND card_id = ?", (user_id, card_id))
+    else:
+        if conn.execute("SELECT COUNT(*) FROM inventory WHERE user_id = ? AND is_equipped = 1", (user_id,)).fetchone()[0] >= 3:
+            conn.close()
+            return await callback.answer("❌ Максимум 3 карты! Сначала снимите другую.", show_alert=True)
+        conn.execute("UPDATE inventory SET is_equipped = 1 WHERE user_id = ? AND card_id = ?", (user_id, card_id))
+    conn.commit()
+    conn.close()
+    
+    text, markup = await get_equip_menu(bot.id, user_id)
+    try: await callback.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+    except: pass
+    await callback.answer("Экипировка обновлена!")
+
+async def process_equip_auto(callback: CallbackQuery, bot: Bot):
+    owner_id = int(callback.data.split("_")[2])
+    if callback.from_user.id != owner_id: return await callback.answer("Это не твоя экипировка!", show_alert=True)
+    user_id = callback.from_user.id
+    conn = get_db_connection(bot.id)
+    conn.execute("UPDATE inventory SET is_equipped = 0 WHERE user_id = ?", (user_id,))
+    best_cards = conn.execute("SELECT i.card_id FROM inventory i JOIN cards c ON i.card_id = c.card_id WHERE i.user_id = ? AND i.amount > 0 ORDER BY (c.damage + c.health) DESC LIMIT 3", (user_id,)).fetchall()
+    for (c_id,) in best_cards: conn.execute("UPDATE inventory SET is_equipped = 1 WHERE user_id = ? AND card_id = ?", (user_id, c_id))
+    conn.commit()
+    conn.close()
+    
+    text, markup = await get_equip_menu(bot.id, user_id)
+    try: await callback.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+    except: pass
+    await callback.answer("Лучшие карты экипированы!")
+
+async def process_equip_clear(callback: CallbackQuery, bot: Bot):
+    owner_id = int(callback.data.split("_")[2])
+    if callback.from_user.id != owner_id: return await callback.answer("Это не твоя экипировка!", show_alert=True)
+    user_id = callback.from_user.id
+    conn = get_db_connection(bot.id)
+    conn.execute("UPDATE inventory SET is_equipped = 0 WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+    text, markup = await get_equip_menu(bot.id, user_id)
+    try: await callback.message.edit_text(text, parse_mode="HTML", reply_markup=markup)
+    except: pass
+    await callback.answer("Все карты сняты!")
+
+# === МАТЧМЕЙКИНГ В ЛС И БОЙ С БОТОМ ===
+async def search_update_loop(bot: Bot, user_id: int, cat: int):
+    try:
+        queue = MATCHMAKING[bot.id][cat]
+        while user_id in queue:
+            data = queue[user_id]
+            elapsed = int(time.time() - data['start_time'])
+            
+            text = f"<b>🔍 Поиск противника...\n⏳ Время • {elapsed} сек\n👥 Игроки в подборе • {len(queue)}</b>"
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_search")],
+                [InlineKeyboardButton(text="🤖 Бой с ботом", callback_data=f"bot_battle_{cat}")]
+            ])
+            try: await data['msg'].edit_text(text, reply_markup=kb, parse_mode="HTML")
+            except TelegramBadRequest: pass
+            except TelegramRetryAfter as e: await asyncio.sleep(e.retry_after)
+            await asyncio.sleep(3)
+    except asyncio.CancelledError: pass
+
+async def cmd_pvpsearch(message: Message, bot: Bot, state: FSMContext):
+    await state.clear()
+    if message.chat.type != "private": return await message.answer("<b>⚔️ Эта команда работает только в личных сообщениях с ботом!</b>", parse_mode="HTML")
+    user_id = message.from_user.id
+
+    if bot.id not in ACTIVE_BATTLES: ACTIVE_BATTLES[bot.id] = set()
+    if user_id in ACTIVE_BATTLES[bot.id]:
+        return await message.answer("<b>❌ Ты уже находишься в бою! Заверши его перед новым поиском.</b>", parse_mode="HTML")
+        
+    if user_id in SEARCH_TASKS:
+        return await message.answer("<b>❌ Ты уже ищешь противника!</b>", parse_mode="HTML")
+        
+    SEARCH_TASKS[user_id] = "pending"
+
+    conn = get_db_connection(bot.id)
+    has_cards = conn.execute("SELECT 1 FROM inventory WHERE user_id = ? AND is_equipped = 1", (user_id,)).fetchone()
+    res = conn.execute("SELECT trophies FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    trophies = res[0] if res else 0
+    conn.close()
+
+    if not has_cards: 
+        del SEARCH_TASKS[user_id]
+        return await message.answer("<b>У тебя нет экипированных карт! Используй раздел Экипировка</b>", parse_mode="HTML")
+
+    if bot.id not in MATCHMAKING: MATCHMAKING[bot.id] = {1:{}, 2:{}, 3:{}, 4:{}, 5:{}, 6:{}}
+
+    cat = get_mm_category(trophies)
+    queue = MATCHMAKING[bot.id][cat]
+
+    if len(queue) > 0:
+        opponent_id, opp_data = list(queue.items())[0]
+        del queue[opponent_id]
+        
+        if opponent_id in SEARCH_TASKS:
+            if isinstance(SEARCH_TASKS[opponent_id], asyncio.Task):
+                SEARCH_TASKS[opponent_id].cancel()
+            del SEARCH_TASKS[opponent_id]
+            
+        del SEARCH_TASKS[user_id]
+        
+        ACTIVE_BATTLES[bot.id].add(user_id)
+        ACTIVE_BATTLES[bot.id].add(opponent_id)
+
+        try: await opp_data['msg'].edit_text(f"<b>⚔️ Противник найден!\nТвой соперник: {html.escape(message.from_user.first_name)}\n\n<i>Бой начнется через 3 секунды...</i></b>", parse_mode="HTML")
+        except: pass
+        await smart_reply(message, f"⚔️ Противник найден!\nТвой соперник: {html.escape(opp_data['user'].first_name)}\n\n<i>Бой начнется через 3 секунды...</i>")
+        
+        await asyncio.sleep(3)
+        duel_data = {'p1_id': opponent_id, 'p2_id': message.from_user.id, 'p1_name': html.escape(opp_data['user'].first_name), 'p2_name': html.escape(message.from_user.first_name)}
+        asyncio.create_task(run_battle_engine(bot, opponent_id, duel_data, is_private=True, chat2=message.from_user.id))
+        return
+
+    msg = await message.answer("<b>🔍 Запуск радара...</b>", parse_mode="HTML")
+    queue[user_id] = {'user': message.from_user, 'msg': msg, 'start_time': time.time()}
+    SEARCH_TASKS[user_id] = asyncio.create_task(search_update_loop(bot, user_id, cat))
+
+async def process_cancel_search(callback: CallbackQuery, bot: Bot):
+    user_id = callback.from_user.id
+    if bot.id in MATCHMAKING:
+        for cat, queue in MATCHMAKING[bot.id].items():
+            if user_id in queue:
+                del queue[user_id]
+                if user_id in SEARCH_TASKS:
+                    if isinstance(SEARCH_TASKS[user_id], asyncio.Task):
+                        SEARCH_TASKS[user_id].cancel()
+                    del SEARCH_TASKS[user_id]
+                try: await callback.message.edit_text("<b>❌ Поиск противника отменен.</b>", parse_mode="HTML")
+                except: pass
+                return await callback.answer()
+    await callback.answer("Ты не в поиске!", show_alert=True)
+
+async def process_bot_battle(callback: CallbackQuery, bot: Bot):
+    cat = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+    
+    if bot.id not in ACTIVE_BATTLES: ACTIVE_BATTLES[bot.id] = set()
+    if user_id in ACTIVE_BATTLES[bot.id]:
+        return await callback.answer("Ты уже находишься в бою!", show_alert=True)
+        
+    ACTIVE_BATTLES[bot.id].add(user_id)
+    
+    if bot.id in MATCHMAKING and user_id in MATCHMAKING[bot.id][cat]:
+        del MATCHMAKING[bot.id][cat][user_id]
+        if user_id in SEARCH_TASKS:
+            if isinstance(SEARCH_TASKS[user_id], asyncio.Task):
+                SEARCH_TASKS[user_id].cancel()
+            del SEARCH_TASKS[user_id]
+            
+    conn = get_db_connection(bot.id)
+    p_team_db = conn.execute("SELECT c.card_id, c.name, c.damage, c.health, c.element, c.attack_type FROM inventory i JOIN cards c ON i.card_id = c.card_id WHERE i.user_id = ? AND i.is_equipped = 1", (user_id,)).fetchall()
+    
+    if not p_team_db:
+        ACTIVE_BATTLES[bot.id].remove(user_id)
+        conn.close()
+        return await callback.answer("У тебя нет экипированных карт!", show_alert=True)
+        
+    p_team = [{'id': r[0], 'name': r[1], 'dmg': r[2], 'hp': r[3], 'element': r[4], 'attack_type': r[5] if len(r)>5 else '', 'is_attacker': False, 'damage_taken': 0, 'on_fire': 0} for r in p_team_db]
+    
+    allowed_rarities = BOT_DECKS.get(cat, ["⬜️Обычная⬜️"])
+    placeholders = ','.join(['?'] * len(allowed_rarities))
+    query = f"SELECT card_id, name, damage, health, element, attack_type FROM cards WHERE rarity IN ({placeholders})"
+    b_pool = conn.execute(query, allowed_rarities).fetchall()
+    
+    if not b_pool:
+        b_pool = conn.execute("SELECT card_id, name, damage, health, element, attack_type FROM cards").fetchall()
+        
+    conn.close()
+    
+    if not b_pool:
+        ACTIVE_BATTLES[bot.id].remove(user_id)
+        return await callback.answer("В базе нет карт для бота!", show_alert=True)
+        
+    b_team_db = random.choices(b_pool, k=3)
+    b_team = [{'id': r[0], 'name': r[1], 'dmg': r[2], 'hp': r[3], 'element': r[4], 'attack_type': r[5] if len(r)>5 else '', 'is_attacker': False, 'damage_taken': 0, 'on_fire': 0} for r in b_team_db]
+    
+    try: await callback.message.edit_text("<b>⚔️ Противник найден: 🤖 Бот-Гладиатор!\n\n<i>Бой начнется через 3 секунды...</i></b>", parse_mode="HTML")
+    except: pass
+    
+    await asyncio.sleep(3)
+    duel_data = {'p1_id': user_id, 'p2_id': 0, 'p1_name': html.escape(callback.from_user.first_name), 'p2_name': "🤖 Бот"}
+    asyncio.create_task(run_battle_engine_core(bot, callback.message.chat.id, p_team, b_team, duel_data))
+    await callback.answer()
+
+# === ДУЭЛИ В ГРУППЕ ===
+async def cmd_duel(message: Message, bot: Bot, state: FSMContext):
+    await state.clear()
+    if message.chat.type == "private": return await message.answer("<b>⚔️ Дуэли доступны только в группах!</b>", parse_mode="HTML")
+    if not message.reply_to_message: return await message.answer("<b>Чтобы вызвать игрока на дуэль, ответь на его сообщение командой /duel</b>", parse_mode="HTML")
+        
+    target = message.reply_to_message.from_user
+    if target.id == message.from_user.id or target.is_bot: return await message.answer("<b>Нельзя вызвать на дуэль самого себя или бота!</b>", parse_mode="HTML")
+    
+    if bot.id not in ACTIVE_BATTLES: ACTIVE_BATTLES[bot.id] = set()
+    if message.from_user.id in ACTIVE_BATTLES[bot.id]:
+        return await message.answer("<b>❌ Ты уже находишься в бою!</b>", parse_mode="HTML")
+    if target.id in ACTIVE_BATTLES[bot.id]:
+        return await message.answer(f"<b>❌ Игрок {html.escape(target.first_name)} уже находится в бою!</b>", parse_mode="HTML")
+        
+    conn = get_db_connection(bot.id)
+    p1_has_cards = conn.execute("SELECT 1 FROM inventory WHERE user_id = ? AND is_equipped = 1", (message.from_user.id,)).fetchone()
+    p2_has_cards = conn.execute("SELECT 1 FROM inventory WHERE user_id = ? AND is_equipped = 1", (target.id,)).fetchone()
+    conn.close()
+    
+    if not p1_has_cards: return await message.answer("<b>У тебя нет экипированных карт для дуэли! Используй /equip</b>", parse_mode="HTML")
+    if not p2_has_cards: return await message.answer(f"<b>У игрока {html.escape(target.first_name)} нет экипированных карт!</b>", parse_mode="HTML")
+        
+    duel_id = f"{message.chat.id}_{message.message_id}"
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Принять", callback_data=f"duel_acc_{duel_id}"), InlineKeyboardButton(text="❌ Отказаться", callback_data=f"duel_dec_{duel_id}")]])
+    
+    mention_target = target.mention_html() if not target.username else f"@{target.username}"
+    mention_p1 = message.from_user.mention_html() if not message.from_user.username else f"@{message.from_user.username}"
+    msg = await message.answer(f"<b>⚔️ {mention_target}, игрок {mention_p1} вызывает тебя на дуэль!\nУ тебя есть 1 минута на принятие решения.</b>", reply_markup=kb, parse_mode="HTML")
+    
+    if bot.id not in PENDING_DUELS: PENDING_DUELS[bot.id] = {}
+        
+    async def cancel_duel():
+        await asyncio.sleep(60)
+        if duel_id in PENDING_DUELS.get(bot.id, {}):
+            del PENDING_DUELS[bot.id][duel_id]
+            try: await msg.edit_text(f"<b>⏳ Время вышло! Дуэль отменена.</b>", parse_mode="HTML")
+            except: pass
+            
+    PENDING_DUELS[bot.id][duel_id] = {'p1_id': message.from_user.id, 'p2_id': target.id, 'p1_name': html.escape(message.from_user.first_name), 'p2_name': html.escape(target.first_name), 'msg': msg, 'task': asyncio.create_task(cancel_duel())}
+
+async def process_duel_acc(callback: CallbackQuery, bot: Bot):
+    duel_id = callback.data.split("duel_acc_")[1]
+    duels = PENDING_DUELS.get(bot.id, {})
+    if duel_id not in duels: return await callback.answer("Время вызова истекло или дуэль уже завершена!", show_alert=True)
+    duel_data = duels[duel_id]
+    if callback.from_user.id != duel_data['p2_id']: return await callback.answer("Этот вызов адресован не тебе!", show_alert=True)
+    
+    if bot.id not in ACTIVE_BATTLES: ACTIVE_BATTLES[bot.id] = set()
+    if duel_data['p1_id'] in ACTIVE_BATTLES[bot.id] or duel_data['p2_id'] in ACTIVE_BATTLES[bot.id]:
+        return await callback.answer("Один из игроков уже участвует в другом бою!", show_alert=True)
+        
+    ACTIVE_BATTLES[bot.id].add(duel_data['p1_id'])
+    ACTIVE_BATTLES[bot.id].add(duel_data['p2_id'])
+    
+    for uid in (duel_data['p1_id'], duel_data['p2_id']):
+        if uid in SEARCH_TASKS:
+            if isinstance(SEARCH_TASKS[uid], asyncio.Task): SEARCH_TASKS[uid].cancel()
+            del SEARCH_TASKS[uid]
+        if bot.id in MATCHMAKING:
+            for cat in MATCHMAKING[bot.id]:
+                if uid in MATCHMAKING[bot.id][cat]: del MATCHMAKING[bot.id][cat][uid]
+        
+    duel_data['task'].cancel()
+    del duels[duel_id]
+    try: await callback.message.edit_text("<b>⚔️ Вызов принят! Подготовка к бою...</b>", parse_mode="HTML")
+    except: pass
+    await callback.answer("Бой начинается!")
+    asyncio.create_task(run_battle_engine(bot, callback.message.chat.id, duel_data, is_private=False))
+
+async def process_duel_dec(callback: CallbackQuery, bot: Bot):
+    duel_id = callback.data.split("duel_dec_")[1]
+    duels = PENDING_DUELS.get(bot.id, {})
+    if duel_id not in duels: return await callback.answer("Время вызова истекло или дуэль уже завершена!", show_alert=True)
+    duel_data = duels[duel_id]
+    if callback.from_user.id != duel_data['p2_id']: return await callback.answer("Этот вызов адресован не тебе!", show_alert=True)
+        
+    duel_data['task'].cancel()
+    del duels[duel_id]
+    try: await callback.message.edit_text(f"<b>❌ Игрок {duel_data['p2_name']} отказался от дуэли с {duel_data['p1_name']}.</b>", parse_mode="HTML")
+    except: pass
+    await callback.answer("Вы отказались от дуэли.")
+
+# === УНИВЕРСАЛЬНЫЙ БОЕВОЙ ДВИЖОК ===
+async def run_battle_engine(bot: Bot, chat_id: int, duel_data: dict, is_private=False, chat2=None):
+    p1_id, p2_id = duel_data['p1_id'], duel_data['p2_id']
+    conn = get_db_connection(bot.id)
+    def get_team(uid):
+        return [{'id': r[0], 'name': r[1], 'dmg': r[2], 'hp': r[3], 'element': r[4], 'attack_type': r[5] if len(r)>5 else '', 'is_attacker': False, 'damage_taken': 0, 'on_fire': 0} for r in conn.execute("SELECT c.card_id, c.name, c.damage, c.health, c.element, c.attack_type FROM inventory i JOIN cards c ON i.card_id = c.card_id WHERE i.user_id = ? AND i.is_equipped = 1", (uid,)).fetchall()]
+    team1, team2 = get_team(p1_id), get_team(p2_id)
+    conn.close()
+    
+    if not team1 or not team2:
+        err = "<b>❌ Ошибка: У одного из игроков пропали экипированные карты.</b>"
+        try: await bot.send_message(chat_id, err, parse_mode="HTML")
+        except: pass
+        if is_private and chat2:
+            try: await bot.send_message(chat2, err, parse_mode="HTML")
+            except: pass
+        if p1_id in ACTIVE_BATTLES.get(bot.id, set()): ACTIVE_BATTLES[bot.id].remove(p1_id)
+        if p2_id != 0 and p2_id in ACTIVE_BATTLES.get(bot.id, set()): ACTIVE_BATTLES[bot.id].remove(p2_id)
+        return
+        
+    await run_battle_engine_core(bot, chat_id, team1, team2, duel_data, is_private, chat2)
+
+async def run_battle_engine_core(bot: Bot, chat_id: int, team1: list, team2: list, duel_data: dict, is_private=False, chat2=None):
+    p1_name, p2_name = duel_data['p1_name'], duel_data['p2_name']
+    p1_id, p2_id = duel_data['p1_id'], duel_data['p2_id']
+    
+    try:
+        def render_status(t1, t2, turn):
+            lines = [f"🥊 Дуэль: {html.escape(p1_name)} VS {html.escape(p2_name)}"]
+            if turn == 0: lines.append("📜 Подготовка к бою... 📜\n")
+            else: lines.append(f"📜 Ход {turn} 📜\n")
+                
+            lines.append(f"👤 Команда {html.escape(p1_name)}:")
+            for c in t1:
+                atk_icon = " ⚔️" if c.get('is_attacker') else ""
+                dmg = c.get('damage_taken', 0)
+                dmg_icon = ""
+                if dmg > 0:
+                    dmg_icon = f" -{dmg}❤️(☠️)" if c['hp'] <= 0 else f" -{dmg}❤️"
+                fire_icon = " 🔥" if c.get('on_fire', 0) > 0 else ""
+                elem_str = fmt_el(c['element'], c.get('attack_type', ''))
+                lines.append(f"• {html.escape(c['name'])} ({elem_str}){atk_icon}{dmg_icon}{fire_icon}\n  ⚔️{c['dmg']} • ❤️{max(0, c['hp'])}")
+                
+            lines.append("\n---------------------------")
+            lines.append(f"👤 Команда {html.escape(p2_name)}:")
+            for c in t2:
+                atk_icon = " ⚔️" if c.get('is_attacker') else ""
+                dmg = c.get('damage_taken', 0)
+                dmg_icon = ""
+                if dmg > 0:
+                    dmg_icon = f" -{dmg}❤️(☠️)" if c['hp'] <= 0 else f" -{dmg}❤️"
+                fire_icon = " 🔥" if c.get('on_fire', 0) > 0 else ""
+                elem_str = fmt_el(c['element'], c.get('attack_type', ''))
+                lines.append(f"• {html.escape(c['name'])} ({elem_str}){atk_icon}{dmg_icon}{fire_icon}\n  ⚔️{c['dmg']} • ❤️{max(0, c['hp'])}")
+                
+            return "<b>" + "\n".join(lines) + "</b>"
+            
+        msgs = []
+        try: msgs.append(await bot.send_message(chat_id, render_status(team1, team2, 0), parse_mode="HTML"))
+        except TelegramRetryAfter as e: await asyncio.sleep(e.retry_after)
+        except: pass
+
+        if is_private and chat2:
+            try: msgs.append(await bot.send_message(chat2, render_status(team1, team2, 0), parse_mode="HTML"))
+            except TelegramRetryAfter as e: await asyncio.sleep(e.retry_after)
+            except: pass
+        
+        turn = 0
+        while True:
+            # Очистка мертвых в начале хода
+            team1 = [c for c in team1 if c['hp'] > 0]
+            team2 = [c for c in team2 if c['hp'] > 0]
+            
+            if not team1 or not team2: break
+                
+            await asyncio.sleep(5)
+            turn += 1
+            
+            for c in team1 + team2: 
+                c['is_attacker'] = False
+                c['damage_taken'] = 0
+                
+            # Урон от огня (Срабатывает в начале хода)
+            for c in team1 + team2:
+                if c.get('on_fire', 0) > 0:
+                    c['hp'] -= c['on_fire']
+                    c['damage_taken'] += c['on_fire']
+                    c['on_fire'] = 0
+
+            # Кто выжил после ожогов, тот атакует
+            alive_t1 = [c for c in team1 if c['hp'] > 0]
+            alive_t2 = [c for c in team2 if c['hp'] > 0]
+            
+            if alive_t1 and alive_t2:
+                atk_team, def_team = (alive_t1, alive_t2) if turn % 2 != 0 else (alive_t2, alive_t1)
+                attacker = random.choice(atk_team)
+                attacker['is_attacker'] = True
+                atype = attacker.get('attack_type', '')
+                
+                targets = []
+                if atype == '🛜AOE🛜':
+                    targets = list(def_team)
+                elif atype == '💥SPLASH💥':
+                    targets = random.sample(def_team, min(2, len(def_team)))
+                else:
+                    targets = [random.choice(def_team)]
+                
+                for defender in targets:
+                    mult = 1.2 if defender['element'] in ELEMENT_ADVANTAGES.get(attacker['element'], []) else (0.7 if attacker['element'] in ELEMENT_ADVANTAGES.get(defender['element'], []) else 1.0)
+                    dmg = max(1, int(attacker['dmg'] * mult))
+                    
+                    defender['hp'] -= dmg
+                    defender['damage_taken'] += dmg
+                    
+                    if atype == '🔥FIRE🔥':
+                        defender['on_fire'] = attacker['dmg'] # Поджог на урон атаки
+            
+            # Отображаем результаты текущего хода
+            new_status = render_status(team1, team2, turn)
+            for m in msgs:
+                try: await m.edit_text(new_status, parse_mode="HTML")
+                except TelegramRetryAfter as e: await asyncio.sleep(e.retry_after)
+                except: pass
+                
+        p_won = len(team1) > 0
+        win_name = p1_name if p_won else p2_name
+        lose_name = p2_name if p_won else p1_name
+        
+        conn = get_db_connection(bot.id)
+        
+        res1 = conn.execute("SELECT trophies, balance FROM users WHERE user_id = ?", (p1_id,)).fetchone()
+        p1_tr, p1_bal = (res1[0], res1[1]) if res1 else (0, 0)
+        
+        if p_won:
+            win_diff, coins_won = get_win_trophies(p1_tr), get_win_coins(p1_tr)
+            conn.execute("UPDATE users SET trophies=?, balance=? WHERE user_id=?", (p1_tr + win_diff, p1_bal + coins_won, p1_id))
+            final_log = f"<b>🏆 Бой окончен!\nПобедитель: {html.escape(win_name)} (+{win_diff} 🏆, +{coins_won} 💰)\nПроигравший: {html.escape(lose_name)}</b>"
+        else:
+            loss_diff = get_loss_trophies(p1_tr)
+            conn.execute("UPDATE users SET trophies=? WHERE user_id=?", (max(0, p1_tr - loss_diff), p1_id))
+            final_log = f"<b>🏆 Бой окончен!\nПобедитель: {html.escape(win_name)}\nПроигравший: {html.escape(lose_name)} (-{loss_diff} 🏆)</b>"
+
+        if p2_id != 0:
+            res2 = conn.execute("SELECT trophies, balance FROM users WHERE user_id = ?", (p2_id,)).fetchone()
+            p2_tr, p2_bal = (res2[0], res2[1]) if res2 else (0, 0)
+            if not p_won:
+                win_diff_2, coins_won_2 = get_win_trophies(p2_tr), get_win_coins(p2_tr)
+                conn.execute("UPDATE users SET trophies=?, balance=? WHERE user_id=?", (p2_tr + win_diff_2, p2_bal + coins_won_2, p2_id))
+                final_log = f"<b>🏆 Бой окончен!\nПобедитель: {html.escape(win_name)} (+{win_diff_2} 🏆, +{coins_won_2} 💰)\nПроигравший: {html.escape(lose_name)} (-{loss_diff} 🏆)</b>"
+            else:
+                loss_diff_2 = get_loss_trophies(p2_tr)
+                conn.execute("UPDATE users SET trophies=? WHERE user_id=?", (max(0, p2_tr - loss_diff_2), p2_id))
+                final_log = f"<b>🏆 Бой окончен!\nПобедитель: {html.escape(win_name)} (+{win_diff} 🏆, +{coins_won} 💰)\nПроигравший: {html.escape(lose_name)} (-{loss_diff_2} 🏆)</b>"
+
+        conn.commit()
+        conn.close()
+        
+        await asyncio.sleep(2)
+        try: await bot.send_message(chat_id, final_log, parse_mode="HTML")
+        except: pass
+        if is_private and chat2:
+            try: await bot.send_message(chat2, final_log, parse_mode="HTML")
+            except: pass
+            
+    finally:
+        if p1_id in ACTIVE_BATTLES.get(bot.id, set()): ACTIVE_BATTLES[bot.id].remove(p1_id)
+        if p2_id != 0 and p2_id in ACTIVE_BATTLES.get(bot.id, set()): ACTIVE_BATTLES[bot.id].remove(p2_id)
+
+async def catch_all_unknown(message: Message, bot: Bot, state: FSMContext):
+    if message.chat.type == "private" and not message.text.startswith('/'):
+        await message.answer("<b>🤔 Пожалуйста, используй кнопки меню!</b>", parse_mode="HTML", reply_markup=get_main_kb(is_admin(message.from_user.id, bot.id)))
+
+# === ЗАПУСК ===
+async def run_bot(token: str, admin_id: int, is_startup: bool = False):
+    try: bot_id = int(token.split(':')[0])
+    except Exception: return
+    init_db(bot_id, admin_id)
+    ACTIVE_BATTLES[bot_id] = set()
+    dp = Dispatcher(storage=MemoryStorage())
+    
+    # 1. Обычные команды
+    dp.message.register(cmd_start, Command("start", "старт"))
+    dp.message.register(cmd_help, Command("help", "помощь"))
+    
+    dp.message.register(cmd_getcard, Command("getcard", "карта"))
+    dp.message.register(cmd_getcard, F.text == "🃏 Выбить карту", F.chat.type == "private")
+    
+    dp.message.register(cmd_inventory, Command("inventory", "инвентарь"))
+    dp.message.register(cmd_inventory, F.text == "🎒 Инвентарь", F.chat.type == "private")
+    
+    dp.message.register(cmd_equip, Command("equip", "экипировка"))
+    dp.message.register(cmd_equip, F.text == "🛡 Экипировка", F.chat.type == "private")
+    
+    dp.message.register(cmd_pvpsearch, Command("pvpsearch", "поиск"))
+    dp.message.register(cmd_pvpsearch, F.text == "⚔️ Поиск боя", F.chat.type == "private")
+    
+    dp.message.register(cmd_profile, Command("profile", "профиль"))
+    dp.message.register(cmd_profile, F.text == "👤 Профиль", F.chat.type == "private")
+    
+    dp.message.register(cmd_top, Command("top", "топ"))
+    dp.message.register(cmd_top, F.text == "🏆 Топ игроков", F.chat.type == "private")
+    
+    dp.message.register(cmd_topmoney, Command("topmoney", "топденьги"))
+    
+    dp.message.register(cmd_index, Command("index", "индекс"))
+    dp.message.register(cmd_index, F.text == "📖 Индекс", F.chat.type == "private")
+    
+    dp.message.register(cmd_elements, Command("elements", "элементы"))
+    dp.message.register(cmd_elements, F.text == "📊 Стихии", F.chat.type == "private")
+    
+    dp.message.register(cmd_duel, Command("duel", "дуэль"))
+    dp.message.register(cmd_addbot, Command("addbot", "создатьбота"))
+    
+    # Админ команды
+    dp.message.register(cmd_globalmessage, Command("globalmessage", "рассылка"))
+    dp.message.register(cmd_addadmin, Command("addadmin", "добавитьадмина", "добавитадмина"))
+    dp.message.register(cmd_deladmin, Command("deladmin", "удалитьадмина", "удалитадмина"))
+    dp.message.register(cmd_ban, Command("ban"))
+    dp.message.register(cmd_unban, Command("unban", "разбан"))
+    dp.message.register(cmd_getmoney, Command("getmoney"))
+    dp.message.register(cmd_gettrophies, Command("gettrophies"))
+    dp.message.register(cmd_events, Command("luckevent", "cooldownevent", "эвентудачи", "эвентскорости"))
+    dp.message.register(cmd_events_space, F.text.startswith("/cooldown event ") | F.text.startswith("/эвентскорости "))
+    dp.message.register(cmd_goshop, Command("goshop", "обновитьмагазин"))
+    
+    # 2. Машина состояний создания карты
+    dp.message.register(start_add_card, F.text == "Добавить карту", StateFilter(None), F.chat.type == "private")
+    dp.message.register(cancel_action, F.text == "Отмена", F.chat.type == "private")
+    dp.message.register(process_photo, AddCardState.waiting_for_photo, F.photo, F.chat.type == "private")
+    dp.message.register(process_name, AddCardState.waiting_for_name, F.text, F.chat.type == "private")
+    dp.message.register(process_weight, AddCardState.waiting_for_weight, F.text, F.chat.type == "private")
+    dp.callback_query.register(process_rarity, AddCardState.waiting_for_rarity, F.data.startswith("rarity_"))
+    dp.callback_query.register(process_element, AddCardState.waiting_for_element, F.data.startswith("element_"))
+    dp.callback_query.register(process_attack_type, AddCardState.waiting_for_attack_type, F.data.startswith("atype_"))
+    dp.message.register(process_damage, AddCardState.waiting_for_damage, F.text, F.chat.type == "private")
+    dp.message.register(process_health, AddCardState.waiting_for_health, F.text, F.chat.type == "private")
+    dp.message.register(invalid_fsm_input, StateFilter(AddCardState.waiting_for_photo, AddCardState.waiting_for_name, AddCardState.waiting_for_weight, AddCardState.waiting_for_rarity, AddCardState.waiting_for_element, AddCardState.waiting_for_attack_type, AddCardState.waiting_for_damage, AddCardState.waiting_for_health), F.chat.type == "private")
+    
+    # 3. Коллбэки
+    dp.callback_query.register(process_delete_card, F.data.startswith("delcard_"))
+    dp.callback_query.register(process_index_page, F.data.startswith("index_page_"))
+    dp.callback_query.register(process_inv_page, F.data.startswith("inv_page_"))
+    dp.callback_query.register(process_open_equip, F.data.startswith("open_equip_"))
+    dp.callback_query.register(process_equip_select, F.data.startswith("equip_select_"))
+    dp.callback_query.register(process_equip_card, F.data.startswith("eqcard_"))
+    dp.callback_query.register(process_equip_auto, F.data.startswith("equip_auto_"))
+    dp.callback_query.register(process_equip_clear, F.data.startswith("equip_clear_"))
+    dp.callback_query.register(process_duel_acc, F.data.startswith("duel_acc_"))
+    dp.callback_query.register(process_duel_dec, F.data.startswith("duel_dec_"))
+    dp.callback_query.register(process_cancel_search, F.data == "cancel_search")
+    dp.callback_query.register(process_bot_battle, F.data.startswith("bot_battle_"))
+    dp.callback_query.register(process_buy_pack, F.data.startswith("buypack_"))
+    
+    # 4. Перехват неизвестного текста
+    dp.message.register(start_delete_card, F.text == "Удалить карту", StateFilter(None), F.chat.type == "private")
+    dp.message.register(catch_all_unknown, StateFilter(None), F.chat.type == "private")
+    
+    dp.update.middleware(TrackerMiddleware())
+    bot_instance = Bot(token=token)
+    RUNNING_BOTS[bot_id] = bot_instance
+    
+    try:
+        commands = [
+            BotCommand(command="start", description="Перезапустить бота"),
+            BotCommand(command="help", description="Список команд"),
+            BotCommand(command="getcard", description="Выбить карту"),
+            BotCommand(command="inventory", description="Твой инвентарь"),
+            BotCommand(command="equip", description="Экипировка"),
+            BotCommand(command="pvpsearch", description="Поиск боя (ЛС)"),
+            BotCommand(command="duel", description="Вызов на бой (группа)"),
+            BotCommand(command="top", description="Топ игроков"),
+            BotCommand(command="topmoney", description="Топ по монетам"),
+            BotCommand(command="index", description="Индекс карт"),
+            BotCommand(command="profile", description="Твой профиль"),
+            BotCommand(command="elements", description="Таблица стихий")
+        ]
+        await bot_instance.set_my_commands(commands)
+        await bot_instance.delete_webhook(drop_pending_updates=True)
+        logging.info(f"Бот {bot_id} успешно запущен!")
+        
+        if is_startup:
+            conn = get_db_connection(bot_id)
+            cursor = conn.cursor()
+            cursor.execute("SELECT value FROM settings WHERE key = 'last_update_log'")
+            res = cursor.fetchone()
+            last_log = res[0] if res else ""
+            
+            if last_log != UPDATE_LOG_TEXT:
+                await broadcast(bot_instance, UPDATE_LOG_TEXT)
+                cursor.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", ('last_update_log', UPDATE_LOG_TEXT))
+                conn.commit()
+            conn.close()
+            
+        asyncio.create_task(pack_shop_spawner(bot_instance))
+        await dp.start_polling(bot_instance, allowed_updates=["message", "channel_post", "callback_query", "my_chat_member", "chat_member"])
+    except Exception as e: logging.error(f"Ошибка при работе бота {bot_id}: {e}")
+    finally:
+        if bot_id in RUNNING_BOTS: del RUNNING_BOTS[bot_id]
+        await bot_instance.session.close()
+
+async def main():
+    asyncio.create_task(run_bot(TOKEN, MAIN_ADMIN_ID, is_startup=True))
+    init_db(MAIN_BOT_ID, MAIN_ADMIN_ID)
+    conn = get_db_connection(MAIN_BOT_ID)
+    child_bots = conn.execute("SELECT token, owner_id FROM child_bots").fetchall()
+    conn.close()
+    for c_token, c_owner in child_bots: asyncio.create_task(run_bot(c_token, c_owner, is_startup=True))
+    asyncio.create_task(ad_broadcaster())
+    print("Мульти-бот система запущена и работает!")
+    await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    asyncio.run(main())
